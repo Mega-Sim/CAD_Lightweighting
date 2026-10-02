@@ -12,14 +12,31 @@ No scope is privileged. Candidate discovery may operate on the whole drawing, re
 - bounded whole-drawing numeric quantization probes
 - exact reference + transform
 - near reference + residual
+- reflection-symmetry family probes
 - repeated transform family / grid probe
 - repeated sequence / grammar probe
+- LWPOLYLINE primitive-fit + residual hook
 - whole-drawing structural composite estimate
 - research-side tensor, wavelet, and spectral probes
 
+## Ordered transform recipes
+
+Every candidate carries an ordered `transform_chain`. Examples include:
+
+- `canonicalize → reference_transform → restore_entity_units`
+- `canonicalize → reflection_symmetry → placement_stream → restore_entity_units`
+- `canonicalize → primitive_fit → capture_residual → restore_entity_units`
+- `numeric_quantization`
+
+The order is part of the candidate representation. Different orderings must be represented as distinct candidates so M5 can compare them instead of treating a set of transforms as unordered.
+
 ## Canonical signatures
 
-Supported geometry is transformed into a temporary canonical frame before hashing so translation and XY rotation do not prevent equal shapes from matching. Physical scale is preserved by default. Unsupported/incomplete geometry and TEXT are deliberately isolated to prevent unsafe false deduplication.
+Supported geometry is transformed into a temporary canonical frame before hashing so translation and XY rotation do not prevent equal shapes from matching. Physical scale is preserved by default. Reflection-family signatures additionally compare a canonical Y-reflected representation. Unsupported/incomplete geometry and TEXT are deliberately isolated to prevent unsafe false deduplication.
+
+## Primitive reduction hook
+
+The first primitive-reduction hook targets supported LWPOLYLINE geometry with at least three points. It is intentionally analysis-only in the generic materializer: the candidate records a primitive fit plus residual reconstruction recipe but M6 will not serialize it until a backend-specific materializer can prove the same final polyline selection/edit unit and pass independent verification.
 
 ## First materializable lossy family
 
@@ -33,14 +50,16 @@ The first implementation only quantizes coordinate/distance-like geometry fields
 
 ## Customer semantics
 
-Every representation candidate has `preserves_selection_cardinality=true` as a hard requirement. Internal reference/grid/grammar representations must expand back into the original customer-visible entity units before final DWG serialization.
+Every representation candidate has `preserves_selection_cardinality=true` as a hard requirement. Internal reference/grid/grammar/symmetry/primitive representations must expand back into the original customer-visible entity units before final DWG serialization.
 
-The generic materializer currently refuses structural/tensor/wavelet/spectral candidates that cannot yet be encoded into a smaller standard CAD representation without changing selection/edit semantics. A licensed native backend/materializer can later implement those recipes while keeping the same verifier contract.
+The generic materializer currently refuses structural/tensor/wavelet/spectral/primitive candidates that cannot yet be encoded into a smaller standard CAD representation without changing selection/edit semantics. A licensed native backend/materializer can later implement those recipes while keeping the same verifier contract.
 
 ## Safety
 
-`validate_candidate_set()` rejects duplicate/unknown source IDs, duplicate candidate IDs, and candidates that declare loss of selection cardinality. Geometry/semantic/interaction validation remains an independent M6 gate after actual DWG serialization.
+`validate_candidate_set()` rejects duplicate/unknown source IDs, duplicate candidate IDs, missing ordered transform chains, invalid conflict references, self-conflicts, and candidates that declare loss of selection cardinality. Candidate JSON includes `conflicts` and `transform_chain` so the Python research search layer sees the same constraint graph as C++.
+
+Geometry/semantic/interaction validation remains an independent M6 gate after actual DWG serialization.
 
 ## Verification status
 
-Regression test sources are included for translation/rotation-invariant matching, reference candidate discovery, near-repeat residual candidates, numeric quantization candidate generation, and invalid coverage. Per project workflow, tests are not executed until a PR is requested.
+Regression test sources cover translation/rotation-invariant matching, reference candidate discovery, near-repeat residual candidates, reflection symmetry, primitive-reduction hook generation, ordered transform-chain serialization, numeric quantization candidate generation, and invalid coverage. Per project workflow, tests are not executed until a PR is requested.
