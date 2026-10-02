@@ -87,6 +87,12 @@ tests/                TDD regression fixtures/tests
 docs/                 decisions and milestone notes
 ```
 
+## Active development
+
+- Issue #1: Milestone 2 loss/difference trace and richer semantic verification.
+- Branch: `feature/milestone-2-loss-trace`.
+- Branch is created from the latest `main`; previous commits are not used as a development base or UI reference.
+
 ## Next milestone
 
-Milestone 2 should deepen the independent comparison/trace foundation before any lossy optimization is allowed: richer BLOCK/INSERT/GROUP/OBJECT/XDATA semantics, geometry-normalized comparison, and entity-level cause tracing across real DWG round trips.
+Milestone 2 deepens the independent comparison/trace foundation before any lossy optimization is allowed: richer BLOCK/INSERT/GROUP/OBJECT/XDATA semantics, geometry-normalized comparison, and entity-level cause tracing across real DWG round trips.
