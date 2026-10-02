@@ -1,6 +1,7 @@
 #include <cadopt/candidate.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -57,6 +58,30 @@ static void test_near_repeat_creates_residual_candidate() {
             "near repeat candidate must account for residual bytes");
 }
 
+static void test_numeric_quantization_candidate_is_whole_drawing_and_explicit() {
+    std::vector<cadopt::GeometryView> views{
+        make_line("a", {0.123456789, 0.0, 0.0}, {10.123456789, 0.0, 0.0}),
+        make_line("b", {20.123456789, 0.0, 0.0}, {30.123456789, 0.0, 0.0})
+    };
+    cadopt::CandidateDiscoveryOptions options;
+    options.numeric_quantization_steps = {1.0e-9, 5.0e-9};
+    const auto set = cadopt::discover_representation_candidates(views, options);
+
+    const auto found = std::find_if(set.candidates.begin(), set.candidates.end(), [](const auto& c) {
+        return c.kind == cadopt::CandidateKind::NumericQuantization
+            && std::abs(c.numeric_parameter - 5.0e-9) < 1.0e-18;
+    });
+    require(found != set.candidates.end(), "numeric quantization candidate was not discovered");
+    require(found->scope.kind == cadopt::CandidateScopeKind::WholeDrawing,
+            "numeric quantization must be represented as an explicit whole-drawing candidate");
+    require(found->source_ids == set.source_universe,
+            "whole-drawing quantization candidate must cover the complete source universe");
+    require(found->preserves_selection_cardinality,
+            "numeric quantization must never change customer-visible selection cardinality");
+    require(found->loss_risk > 0.0,
+            "numeric quantization must be marked as potentially lossy");
+}
+
 static void test_candidate_validation_rejects_unknown_source() {
     cadopt::CandidateSet set;
     set.source_universe = {"a"};
@@ -74,6 +99,7 @@ int main() {
         test_signature_is_translation_rotation_invariant();
         test_exact_repeat_creates_reference_candidate();
         test_near_repeat_creates_residual_candidate();
+        test_numeric_quantization_candidate_is_whole_drawing_and_explicit();
         test_candidate_validation_rejects_unknown_source();
         std::cout << "cadopt_candidate_tests: PASS\n";
         return 0;
