@@ -1,11 +1,20 @@
 #include <cadopt/dwg_backend.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace cadopt {
 namespace {
@@ -32,6 +41,25 @@ std::string shell_quote(const std::filesystem::path& p) {
 #endif
 }
 
+std::string path_to_utf8(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto wide = path.wstring();
+    if (wide.empty()) return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                           wide.data(), static_cast<int>(wide.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) throw std::runtime_error("unable to convert path to UTF-8");
+    std::string result(static_cast<std::size_t>(needed), '\0');
+    const int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                            wide.data(), static_cast<int>(wide.size()),
+                                            result.data(), needed, nullptr, nullptr);
+    if (written != needed) throw std::runtime_error("unable to convert path to UTF-8");
+    return result;
+#else
+    return path.string();
+#endif
+}
+
 void replace_all(std::string& text, const std::string& from, const std::string& to) {
     std::size_t pos = 0;
     while ((pos = text.find(from, pos)) != std::string::npos) {
@@ -45,6 +73,45 @@ std::string lowercase(std::string text) {
         return static_cast<char>(std::tolower(c));
     });
     return text;
+}
+
+bool prepare_output_path(const std::filesystem::path& output, std::string& message) {
+    std::error_code error;
+    if (!output.parent_path().empty()) {
+        std::filesystem::create_directories(output.parent_path(), error);
+        if (error) {
+            message = "cannot create backend output directory: " + error.message();
+            return false;
+        }
+    }
+    error.clear();
+    if (std::filesystem::exists(output, error) && !error) {
+        std::filesystem::remove(output, error);
+        if (error) {
+            message = "cannot remove stale backend output: " + error.message();
+            return false;
+        }
+    }
+    return true;
+}
+
+ConversionResult finish_conversion_result(const std::filesystem::path& output,
+                                          int code,
+                                          std::string message) {
+    if (code != 0) {
+        if (message.empty()) message = "native backend conversion failed";
+        return {false, code, std::move(message), 0};
+    }
+    std::error_code error;
+    if (!std::filesystem::exists(output, error) || error) {
+        return {false, code, "backend returned success but output file is missing", 0};
+    }
+    error.clear();
+    const auto bytes = std::filesystem::file_size(output, error);
+    if (error) return {false, code, "unable to measure backend output: " + error.message(), 0};
+    if (bytes == 0) return {false, code, "backend produced an empty output file", 0};
+    if (message.empty()) message = "ok";
+    return {true, code, std::move(message), bytes};
 }
 
 } // namespace
@@ -92,12 +159,12 @@ DwgBackendCapabilities capabilities_for_profile(DwgBackendProfile profile) {
     case DwgBackendProfile::OdaSdk:
         caps.name = "ODA Drawings SDK host";
         caps.requires_external_license = true;
-        caps.notes = "Command template should invoke a properly licensed ODA SDK host such as an OdCopyEx-based wrapper.";
+        caps.notes = "Uses either an explicit command host or the cadopt native plugin ABI backed by a separately licensed ODA SDK.";
         break;
     case DwgBackendProfile::RealDwgHost:
         caps.name = "Autodesk RealDWG host";
         caps.requires_external_license = true;
-        caps.notes = "Command template should invoke a separately built/licensed RealDWG host.";
+        caps.notes = "Uses either an explicit command host or the cadopt native plugin ABI backed by a separately licensed RealDWG host.";
         break;
     }
     return caps;
@@ -125,15 +192,9 @@ ConversionResult ExternalCommandDwgBackend::run_template(const std::string& comm
         return {false, -1, "converter command must contain both {input} and {output}", 0};
     }
 
-    std::error_code error;
-    if (!output.parent_path().empty()) {
-        std::filesystem::create_directories(output.parent_path(), error);
-        if (error) return {false, -1, "cannot create converter output directory: " + error.message(), 0};
-    }
-    error.clear();
-    if (std::filesystem::exists(output, error) && !error) {
-        std::filesystem::remove(output, error);
-        if (error) return {false, -1, "cannot remove stale converter output: " + error.message(), 0};
+    std::string prepare_message;
+    if (!prepare_output_path(output, prepare_message)) {
+        return {false, -1, std::move(prepare_message), 0};
     }
 
     std::string command = command_template;
@@ -141,16 +202,7 @@ ConversionResult ExternalCommandDwgBackend::run_template(const std::string& comm
     replace_all(command, "{output}", shell_quote(output));
     const int code = std::system(command.c_str());
     if (code != 0) return {false, code, "converter command failed", 0};
-
-    error.clear();
-    if (!std::filesystem::exists(output, error) || error) {
-        return {false, code, "converter returned success but output file is missing", 0};
-    }
-    error.clear();
-    const auto bytes = std::filesystem::file_size(output, error);
-    if (error) return {false, code, "unable to measure converter output: " + error.message(), 0};
-    if (bytes == 0) return {false, code, "converter produced an empty output file", 0};
-    return {true, code, "ok", bytes};
+    return finish_conversion_result(output, code, "ok");
 }
 
 ConversionResult ExternalCommandDwgBackend::dxf_to_dwg(const std::filesystem::path& input,
@@ -161,6 +213,119 @@ ConversionResult ExternalCommandDwgBackend::dxf_to_dwg(const std::filesystem::pa
 ConversionResult ExternalCommandDwgBackend::dwg_to_dxf(const std::filesystem::path& input,
                                                          const std::filesystem::path& output) const {
     return run_template(dwg_to_dxf_template_, input, output);
+}
+
+struct NativeLibraryDwgBackend::Impl {
+    using ApiVersionFn = int (*)();
+    using NameFn = const char* (*)();
+    using ConvertFn = int (*)(const char*, const char*, char*, std::size_t);
+
+    std::filesystem::path library_path;
+    DwgBackendProfile profile{DwgBackendProfile::ExternalCommand};
+    std::string backend_name;
+#ifdef _WIN32
+    HMODULE handle{};
+#else
+    void* handle{};
+#endif
+    ConvertFn dxf_to_dwg{};
+    ConvertFn dwg_to_dxf{};
+
+    ~Impl() {
+#ifdef _WIN32
+        if (handle) FreeLibrary(handle);
+#else
+        if (handle) dlclose(handle);
+#endif
+    }
+
+    void* symbol(const char* name) const {
+#ifdef _WIN32
+        if (!handle) return nullptr;
+        return reinterpret_cast<void*>(GetProcAddress(handle, name));
+#else
+        if (!handle) return nullptr;
+        return dlsym(handle, name);
+#endif
+    }
+
+    ConversionResult convert(ConvertFn fn,
+                             const std::filesystem::path& input,
+                             const std::filesystem::path& output) const {
+        if (!fn) return {false, -1, "native backend conversion symbol is unavailable", 0};
+        std::string prepare_message;
+        if (!prepare_output_path(output, prepare_message)) {
+            return {false, -1, std::move(prepare_message), 0};
+        }
+        const auto input_utf8 = path_to_utf8(input);
+        const auto output_utf8 = path_to_utf8(output);
+        std::array<char, 4096> diagnostic{};
+        const int code = fn(input_utf8.c_str(), output_utf8.c_str(),
+                            diagnostic.data(), diagnostic.size());
+        std::string message(diagnostic.data());
+        return finish_conversion_result(output, code, std::move(message));
+    }
+};
+
+NativeLibraryDwgBackend::NativeLibraryDwgBackend(std::filesystem::path library_path,
+                                                   DwgBackendProfile profile)
+    : impl_(std::make_unique<Impl>()) {
+    if (profile != DwgBackendProfile::OdaSdk && profile != DwgBackendProfile::RealDwgHost) {
+        throw std::invalid_argument("native DWG plugin profile must be oda-sdk or realdwg-host");
+    }
+    if (library_path.empty()) throw std::invalid_argument("native DWG plugin library path is empty");
+
+    impl_->library_path = std::move(library_path);
+    impl_->profile = profile;
+#ifdef _WIN32
+    impl_->handle = LoadLibraryW(impl_->library_path.wstring().c_str());
+    if (!impl_->handle) throw std::runtime_error("unable to load native DWG backend library");
+#else
+    impl_->handle = dlopen(impl_->library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!impl_->handle) {
+        const char* error = dlerror();
+        throw std::runtime_error(std::string("unable to load native DWG backend library: ")
+                                 + (error ? error : "unknown dlopen error"));
+    }
+#endif
+
+    const auto api_version = reinterpret_cast<Impl::ApiVersionFn>(impl_->symbol("cadopt_backend_api_version"));
+    impl_->dxf_to_dwg = reinterpret_cast<Impl::ConvertFn>(impl_->symbol("cadopt_backend_dxf_to_dwg"));
+    impl_->dwg_to_dxf = reinterpret_cast<Impl::ConvertFn>(impl_->symbol("cadopt_backend_dwg_to_dxf"));
+    const auto name_fn = reinterpret_cast<Impl::NameFn>(impl_->symbol("cadopt_backend_name"));
+
+    if (!api_version || api_version() != 1) {
+        throw std::runtime_error("native DWG backend ABI version mismatch; expected version 1");
+    }
+    if (!impl_->dxf_to_dwg || !impl_->dwg_to_dxf) {
+        throw std::runtime_error("native DWG backend is missing required conversion symbols");
+    }
+    impl_->backend_name = name_fn && name_fn() ? name_fn() : capabilities_for_profile(profile).name;
+}
+
+NativeLibraryDwgBackend::~NativeLibraryDwgBackend() = default;
+NativeLibraryDwgBackend::NativeLibraryDwgBackend(NativeLibraryDwgBackend&&) noexcept = default;
+NativeLibraryDwgBackend& NativeLibraryDwgBackend::operator=(NativeLibraryDwgBackend&&) noexcept = default;
+
+DwgBackendCapabilities NativeLibraryDwgBackend::capabilities() const {
+    auto caps = capabilities_for_profile(impl_->profile);
+    caps.name = impl_->backend_name;
+    caps.notes += " Loaded through cadopt native plugin ABI v1: " + impl_->library_path.string();
+    return caps;
+}
+
+ConversionResult NativeLibraryDwgBackend::dxf_to_dwg(const std::filesystem::path& input,
+                                                       const std::filesystem::path& output) const {
+    return impl_->convert(impl_->dxf_to_dwg, input, output);
+}
+
+ConversionResult NativeLibraryDwgBackend::dwg_to_dxf(const std::filesystem::path& input,
+                                                       const std::filesystem::path& output) const {
+    return impl_->convert(impl_->dwg_to_dxf, input, output);
+}
+
+const std::filesystem::path& NativeLibraryDwgBackend::library_path() const noexcept {
+    return impl_->library_path;
 }
 
 } // namespace cadopt
