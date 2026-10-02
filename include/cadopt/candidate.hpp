@@ -10,6 +10,7 @@ namespace cadopt {
 
 enum class CandidateKind {
     Raw,
+    NumericQuantization,
     ReferenceTransform,
     ReferenceResidual,
     Symmetry,
@@ -37,6 +38,12 @@ struct ScopeDescriptor {
     std::vector<std::string> source_ids;
 };
 
+struct CandidateDiscoveryOptions {
+    // These are research probes only. M6 independently verifies the resulting
+    // DWG and rejects any step that exceeds the configured geometry tolerance.
+    std::vector<double> numeric_quantization_steps{1.0e-10, 5.0e-10, 1.0e-9};
+};
+
 struct CandidateRecipe {
     std::string id;
     CandidateKind kind{CandidateKind::Raw};
@@ -49,6 +56,9 @@ struct CandidateRecipe {
     double estimated_bytes{};
     double residual_estimated_bytes{};
     double loss_risk{};
+    // Generic numeric knob owned by the candidate kind. For
+    // NumericQuantization this is the quantization step in drawing units.
+    double numeric_parameter{};
     bool preserves_selection_cardinality{true};
 };
 
@@ -69,7 +79,9 @@ std::string canonical_signature(const GeometryView& view,
                                 bool normalize_uniform_scale = false);
 double estimate_raw_geometry_bytes(const GeometryView& view);
 double estimate_description_bytes(const std::vector<std::string>& tokens);
-CandidateSet discover_representation_candidates(const std::vector<GeometryView>& views);
+CandidateSet discover_representation_candidates(
+    const std::vector<GeometryView>& views,
+    const CandidateDiscoveryOptions& options = {});
 CandidateValidation validate_candidate_set(const CandidateSet& set);
 std::string candidate_set_to_json(const CandidateSet& set);
 
