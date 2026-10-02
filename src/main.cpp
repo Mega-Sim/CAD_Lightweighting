@@ -8,6 +8,7 @@
 #include <cadopt/verifier.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -33,6 +34,9 @@ struct Options {
     bool keep_artifacts{true};
     std::size_t max_plans{16};
     std::size_t beam_width{64};
+    double geometry_absolute_tolerance{1.0e-9};
+    double geometry_relative_tolerance{1.0e-9};
+    std::vector<double> quantization_steps{1.0e-10, 5.0e-10, 1.0e-9};
 };
 
 static std::string escape_json(const std::string& s) {
@@ -54,6 +58,41 @@ static std::size_t parse_size(const std::string& text, const char* name) {
     return static_cast<std::size_t>(value);
 }
 
+static double parse_nonnegative_double(const std::string& text, const char* name) {
+    std::size_t pos = 0;
+    const double value = std::stod(text, &pos);
+    if (pos != text.size() || !std::isfinite(value) || value < 0.0) {
+        throw std::runtime_error(std::string("invalid non-negative value for ") + name);
+    }
+    return value;
+}
+
+static std::vector<double> parse_positive_double_list(const std::string& text, const char* name) {
+    std::vector<double> values;
+    std::stringstream stream(text);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        if (token.empty()) continue;
+        std::size_t pos = 0;
+        const double value = std::stod(token, &pos);
+        if (pos != token.size() || !std::isfinite(value) || value <= 0.0) {
+            throw std::runtime_error(std::string("invalid positive value in ") + name + ": " + token);
+        }
+        values.push_back(value);
+    }
+    if (values.empty()) {
+        throw std::runtime_error(std::string(name) + " must contain at least one positive value");
+    }
+    return values;
+}
+
+static cadopt::VerificationOptions verification_options(const Options& options) {
+    cadopt::VerificationOptions result;
+    result.absolute_geometry_tolerance = options.geometry_absolute_tolerance;
+    result.relative_geometry_tolerance = options.geometry_relative_tolerance;
+    return result;
+}
+
 static Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
@@ -71,6 +110,15 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--backend-profile") o.backend_profile = value(a.c_str());
         else if (a == "--max-plans") o.max_plans = parse_size(value(a.c_str()), "--max-plans");
         else if (a == "--beam-width") o.beam_width = parse_size(value(a.c_str()), "--beam-width");
+        else if (a == "--geometry-abs-tol") {
+            o.geometry_absolute_tolerance = parse_nonnegative_double(value(a.c_str()), "--geometry-abs-tol");
+        }
+        else if (a == "--geometry-rel-tol") {
+            o.geometry_relative_tolerance = parse_nonnegative_double(value(a.c_str()), "--geometry-rel-tol");
+        }
+        else if (a == "--quantize-steps") {
+            o.quantization_steps = parse_positive_double_list(value(a.c_str()), "--quantize-steps");
+        }
         else if (a == "--cleanup-artifacts") o.keep_artifacts = false;
         else if (a == "--dry-run") o.dry_run = true;
         else if (a == "--research" || a == "--optimize") o.research = true;
@@ -78,12 +126,16 @@ static Options parse_args(int argc, char** argv) {
             std::cout
                 << "cadopt --input input.dxf --output output.dwg [options]\n"
                 << "  --dry-run                 Strict DXF -> IR -> DXF safety check only\n"
-                << "  --research                Discover/search/evaluate multiple representation plans\n"
+                << "  --research                Discover/search/materialize/evaluate representation plans\n"
                 << "  --backend-profile NAME    external|oda-file-converter|oda-sdk|realdwg-host\n"
                 << "  --dxf-to-dwg CMD          Converter command template with {input} and {output}\n"
                 << "  --dwg-to-dxf CMD          Independent reverse command with {input} and {output}\n"
-                << "  --max-plans N             Maximum exact DWG candidate evaluations (default 16)\n"
+                << "  --max-plans N             Maximum exact DWG candidate evaluations (default 16; 0=all)\n"
                 << "  --beam-width N            Beam width for broad candidate search (default 64)\n"
+                << "  --geometry-abs-tol V      Absolute geometry verification tolerance (default 1e-9)\n"
+                << "  --geometry-rel-tol V      Relative geometry verification tolerance (default 1e-9)\n"
+                << "  --quantize-steps CSV      Whole-drawing numeric quantization probes\n"
+                << "                           (default 1e-10,5e-10,1e-9)\n"
                 << "  --work-dir DIR            Candidate artifact directory\n"
                 << "  --cleanup-artifacts       Remove non-winning candidate artifacts\n"
                 << "  --report FILE             Machine-readable JSON report\n";
@@ -112,6 +164,7 @@ static void write_basic_report(const fs::path& path,
 }
 
 static void write_research_report(const fs::path& path,
+                                  const Options& options,
                                   const cadopt::CandidateSet& candidates,
                                   const std::vector<cadopt::CandidatePlan>& plans,
                                   const cadopt::EvaluationReport& evaluation,
@@ -120,6 +173,8 @@ static void write_research_report(const fs::path& path,
     if (!out) throw std::runtime_error("cannot write report: " + path.string());
     out << "{\n  \"milestone\": 6,\n"
         << "  \"phase\": \"research_exact_dwg_search\",\n"
+        << "  \"geometry_tolerance\": {\"absolute\": " << options.geometry_absolute_tolerance
+        << ", \"relative\": " << options.geometry_relative_tolerance << "},\n"
         << "  \"candidate_set\": " << cadopt::candidate_set_to_json(candidates) << ",\n"
         << "  \"search_plans\": [";
     for (std::size_t i = 0; i < plans.size(); ++i) {
@@ -205,6 +260,14 @@ static std::string plan_key(const cadopt::CandidatePlan& plan) {
     return out.str();
 }
 
+static std::vector<std::size_t> raw_candidate_indices(const cadopt::CandidateSet& candidates) {
+    std::vector<std::size_t> indices;
+    for (std::size_t index = 0; index < candidates.candidates.size(); ++index) {
+        if (candidates.candidates[index].kind == cadopt::CandidateKind::Raw) indices.push_back(index);
+    }
+    return indices;
+}
+
 static std::vector<cadopt::CandidatePlan> build_research_plans(
     const cadopt::CandidateSet& candidates,
     std::size_t beam_width,
@@ -214,21 +277,48 @@ static std::vector<cadopt::CandidatePlan> build_research_plans(
     options.beam_width = std::max<std::size_t>(1, beam_width);
     options.max_results = std::max<std::size_t>(max_plans, 16);
 
-    std::vector<cadopt::CandidatePlan> plans;
+    std::vector<cadopt::CandidatePlan> mandatory;
+    std::vector<cadopt::CandidatePlan> optional;
     std::set<std::string> seen;
-    auto add = [&](cadopt::CandidatePlan plan) {
+
+    auto add_mandatory = [&](cadopt::CandidatePlan plan) {
         const auto key = plan_key(plan);
-        if (seen.insert(key).second) plans.push_back(std::move(plan));
+        if (seen.insert(key).second) mandatory.push_back(std::move(plan));
+    };
+    auto add_optional = [&](cadopt::CandidatePlan plan) {
+        const auto key = plan_key(plan);
+        if (seen.insert(key).second) optional.push_back(std::move(plan));
     };
 
-    add(cadopt::greedy_search(candidates));
-    for (auto& plan : cadopt::beam_search(candidates, options)) add(std::move(plan));
-    for (auto& plan : cadopt::exhaustive_search(candidates, options)) add(std::move(plan));
+    const auto raw = raw_candidate_indices(candidates);
+    if (!raw.empty()) add_mandatory(cadopt::build_plan(candidates, raw, "m6:raw-baseline"));
 
-    std::sort(plans.begin(), plans.end(), [](const auto& a, const auto& b) {
+    for (std::size_t index = 0; index < candidates.candidates.size(); ++index) {
+        const auto& candidate = candidates.candidates[index];
+        if (candidate.kind != cadopt::CandidateKind::NumericQuantization) continue;
+        add_mandatory(cadopt::build_plan(candidates, {index}, "m6:" + candidate.id));
+    }
+
+    add_optional(cadopt::greedy_search(candidates));
+    for (auto& plan : cadopt::beam_search(candidates, options)) add_optional(std::move(plan));
+    for (auto& plan : cadopt::exhaustive_search(candidates, options)) add_optional(std::move(plan));
+
+    std::sort(mandatory.begin(), mandatory.end(), [](const auto& a, const auto& b) {
+        if (a.id == "m6:raw-baseline") return true;
+        if (b.id == "m6:raw-baseline") return false;
         if (a.estimated_bytes != b.estimated_bytes) return a.estimated_bytes < b.estimated_bytes;
         return a.id < b.id;
     });
+    std::sort(optional.begin(), optional.end(), [](const auto& a, const auto& b) {
+        if (a.estimated_bytes != b.estimated_bytes) return a.estimated_bytes < b.estimated_bytes;
+        return a.id < b.id;
+    });
+
+    std::vector<cadopt::CandidatePlan> plans;
+    plans.reserve(mandatory.size() + optional.size());
+    for (auto& plan : mandatory) plans.push_back(std::move(plan));
+    for (auto& plan : optional) plans.push_back(std::move(plan));
+
     if (max_plans != 0 && plans.size() > max_plans) plans.resize(max_plans);
     return plans;
 }
@@ -252,6 +342,7 @@ static void trace_winner(const cadopt::EvaluationReport& evaluation,
                                     "winner_representation",
                                     "candidate=" + candidate.id
                                         + ";kind=" + cadopt::candidate_kind_name(candidate.kind)
+                                        + ";materializer=" + winner->materializer
                                         + ";estimated_bytes=" + std::to_string(candidate.estimated_bytes),
                                     candidate.loss_risk > 0.0,
                                     candidate.loss_risk > 0.0 ? "representation_candidate" : "none",
@@ -275,7 +366,10 @@ static int run_research(const Options& opt,
 
     const auto views = cadopt::extract_geometry_views(source);
     trace_canonical_views(views, trace);
-    const auto candidates = cadopt::discover_representation_candidates(views);
+
+    cadopt::CandidateDiscoveryOptions discovery_options;
+    discovery_options.numeric_quantization_steps = opt.quantization_steps;
+    const auto candidates = cadopt::discover_representation_candidates(views, discovery_options);
     const auto candidate_validation = cadopt::validate_candidate_set(candidates);
     if (!candidate_validation.pass) {
         cadopt::VerificationReport empty;
@@ -291,23 +385,24 @@ static int run_research(const Options& opt,
     auto plans = build_research_plans(candidates, opt.beam_width, opt.max_plans);
     std::cout << "[CADOPT][M4] source_entities=" << candidates.source_universe.size()
               << " candidates=" << candidates.candidates.size() << '\n';
-    std::cout << "[CADOPT][M5] exact-evaluation plans=" << plans.size() << '\n';
+    std::cout << "[CADOPT][M5] search/evaluation plans=" << plans.size() << '\n';
 
     const auto profile = cadopt::parse_dwg_backend_profile(opt.backend_profile);
     cadopt::ExternalCommandDwgBackend backend(opt.dxf_to_dwg, opt.dwg_to_dxf, profile);
-    cadopt::StrictSourceMaterializer materializer;
+    cadopt::PlanAwareMaterializer materializer;
     cadopt::EvaluationOptions evaluation_options;
     evaluation_options.work_directory = opt.work_directory.empty()
         ? fs::temp_directory_path() / "cadopt_m6_research"
         : opt.work_directory;
     evaluation_options.max_plans = opt.max_plans;
     evaluation_options.keep_artifacts = opt.keep_artifacts;
+    evaluation_options.verification = verification_options(opt);
 
     auto evaluation = cadopt::evaluate_candidate_plans(source, opt.input, candidates, plans,
                                                         backend, materializer,
                                                         evaluation_options, &trace);
     trace_winner(evaluation, plans, candidates, trace);
-    write_research_report(opt.report, candidates, plans, evaluation, trace);
+    write_research_report(opt.report, opt, candidates, plans, evaluation, trace);
 
     std::string copy_error;
     if (!cadopt::copy_winner_dwg(evaluation, opt.output, &copy_error)) {
@@ -318,6 +413,7 @@ static int run_research(const Options& opt,
 
     const auto* winner = evaluation.winner();
     std::cout << "[CADOPT][M6] winner=" << winner->plan_id
+              << " materializer=" << winner->materializer
               << " exact_dwg_bytes=" << *winner->exact_dwg_bytes
               << " output=" << opt.output << '\n';
     return 0;
@@ -338,7 +434,8 @@ int main(int argc, char** argv) {
         const fs::path staged = fs::temp_directory_path() / "cadopt_safety_staged.dxf";
         source.write(staged, cadopt::DxfWriteMode::PreserveLexical);
         const auto staged_doc = cadopt::DxfDocument::read(staged);
-        auto report = cadopt::verify_semantic_equivalence(source, staged_doc);
+        auto report = cadopt::verify_semantic_equivalence(source, staged_doc,
+                                                          verification_options(opt));
         if (!report.pass) {
             trace_verification_failures(trace, report);
             write_basic_report(opt.report, report, trace, "dxf_roundtrip", "not_started");
@@ -380,7 +477,8 @@ int main(int argc, char** argv) {
         }
 
         const auto roundtrip = cadopt::DxfDocument::read(verify_dxf);
-        report = cadopt::verify_semantic_equivalence(source, roundtrip);
+        report = cadopt::verify_semantic_equivalence(source, roundtrip,
+                                                     verification_options(opt));
         trace_verification_failures(trace, report);
         write_basic_report(opt.report, report, trace, "dwg_roundtrip", "ok");
         if (!report.pass) {
