@@ -34,6 +34,21 @@ double quantize(double value, double step) {
     return std::abs(q) < step * 0.5 ? 0.0 : q;
 }
 
+std::string quantization_id(double step) {
+    std::ostringstream out;
+    out << "quantize:" << std::scientific << std::setprecision(6) << step;
+    return out.str();
+}
+
+double quantization_estimate(double raw_total, double step) {
+    if (raw_total <= 0.0 || !std::isfinite(step) || step <= 0.0) return raw_total;
+    const double decimal_digits = std::max(0.0, -std::log10(step));
+    // Deliberately conservative: this is only a search prior. M6 always
+    // replaces it with the measured serialized DWG byte count.
+    const double hinted_saving = std::clamp((12.0 - decimal_digits) * 0.005, 0.002, 0.05);
+    return std::max(1.0, raw_total * (1.0 - hinted_saving));
+}
+
 double sweep_deg(const GeometryView& view) {
     if (!view.has_angles) return 0.0;
     double sweep = normalize_angle_deg(view.end_angle_deg) - normalize_angle_deg(view.start_angle_deg);
@@ -85,6 +100,7 @@ CandidateRecipe raw_candidate(const GeometryView& view, std::size_t index) {
 std::string candidate_kind_name(CandidateKind kind) {
     switch (kind) {
     case CandidateKind::Raw: return "raw";
+    case CandidateKind::NumericQuantization: return "numeric_quantization";
     case CandidateKind::ReferenceTransform: return "reference_transform";
     case CandidateKind::ReferenceResidual: return "reference_residual";
     case CandidateKind::Symmetry: return "symmetry";
@@ -175,7 +191,9 @@ double estimate_description_bytes(const std::vector<std::string>& tokens) {
     return std::max(1.0, entropy_bytes + static_cast<double>(tokens.size()) * 2.0);
 }
 
-CandidateSet discover_representation_candidates(const std::vector<GeometryView>& views) {
+CandidateSet discover_representation_candidates(
+    const std::vector<GeometryView>& views,
+    const CandidateDiscoveryOptions& options) {
     CandidateSet result;
     result.source_universe.reserve(views.size());
 
@@ -283,6 +301,25 @@ CandidateSet discover_representation_candidates(const std::vector<GeometryView>&
         result.candidates.push_back(std::move(recipe));
     }
 
+    if (!result.source_universe.empty()) {
+        std::set<double> seen_steps;
+        for (const double step : options.numeric_quantization_steps) {
+            if (!std::isfinite(step) || step <= 0.0 || !seen_steps.insert(step).second) continue;
+            CandidateRecipe recipe;
+            recipe.id = quantization_id(step);
+            recipe.kind = CandidateKind::NumericQuantization;
+            recipe.scope = {CandidateScopeKind::WholeDrawing, recipe.id, result.source_universe};
+            recipe.source_ids = result.source_universe;
+            recipe.reconstruction_recipe = "quantize_supported_numeric_geometry_keep_entity_units";
+            recipe.provenance = "bounded_numeric_quantization_exact_dwg_probe";
+            recipe.estimated_bytes = quantization_estimate(raw_total, step);
+            recipe.loss_risk = step;
+            recipe.numeric_parameter = step;
+            recipe.preserves_selection_cardinality = true;
+            result.candidates.push_back(std::move(recipe));
+        }
+    }
+
     if (!result.source_universe.empty() && estimated_structural_savings > 0.0) {
         CandidateRecipe whole;
         whole.id = "whole:structural-composite";
@@ -331,6 +368,17 @@ CandidateValidation validate_candidate_set(const CandidateSet& set) {
                 validation.issues.push_back(candidate.id + " covers source more than once: " + source_id);
             }
         }
+
+        if (candidate.kind == CandidateKind::NumericQuantization) {
+            if (!std::isfinite(candidate.numeric_parameter) || candidate.numeric_parameter <= 0.0) {
+                validation.pass = false;
+                validation.issues.push_back(candidate.id + " has invalid numeric quantization step");
+            }
+            if (candidate.scope.kind != CandidateScopeKind::WholeDrawing || local != universe) {
+                validation.pass = false;
+                validation.issues.push_back(candidate.id + " must cover the complete drawing exactly once");
+            }
+        }
     }
     return validation;
 }
@@ -352,6 +400,7 @@ std::string candidate_set_to_json(const CandidateSet& set) {
             << "\",\"estimated_bytes\":" << candidate.estimated_bytes
             << ",\"residual_estimated_bytes\":" << candidate.residual_estimated_bytes
             << ",\"loss_risk\":" << candidate.loss_risk
+            << ",\"numeric_parameter\":" << candidate.numeric_parameter
             << ",\"preserves_selection_cardinality\":"
             << (candidate.preserves_selection_cardinality ? "true" : "false")
             << ",\"reference_source_id\":\"" << escape_json(candidate.reference_source_id)
