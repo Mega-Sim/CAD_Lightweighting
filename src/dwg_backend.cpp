@@ -114,6 +114,22 @@ ConversionResult finish_conversion_result(const std::filesystem::path& output,
     return {true, code, std::move(message), bytes};
 }
 
+#ifdef _WIN32
+using NativeHandle = HMODULE;
+
+template <typename Function>
+Function load_native_symbol(NativeHandle handle, const char* name) {
+    return handle ? reinterpret_cast<Function>(GetProcAddress(handle, name)) : nullptr;
+}
+#else
+using NativeHandle = void*;
+
+template <typename Function>
+Function load_native_symbol(NativeHandle handle, const char* name) {
+    return handle ? reinterpret_cast<Function>(dlsym(handle, name)) : nullptr;
+}
+#endif
+
 } // namespace
 
 std::string dwg_backend_profile_name(DwgBackendProfile profile) {
@@ -223,11 +239,7 @@ struct NativeLibraryDwgBackend::Impl {
     std::filesystem::path library_path;
     DwgBackendProfile profile{DwgBackendProfile::ExternalCommand};
     std::string backend_name;
-#ifdef _WIN32
-    HMODULE handle{};
-#else
-    void* handle{};
-#endif
+    NativeHandle handle{};
     ConvertFn dxf_to_dwg{};
     ConvertFn dwg_to_dxf{};
 
@@ -236,16 +248,6 @@ struct NativeLibraryDwgBackend::Impl {
         if (handle) FreeLibrary(handle);
 #else
         if (handle) dlclose(handle);
-#endif
-    }
-
-    void* symbol(const char* name) const {
-#ifdef _WIN32
-        if (!handle) return nullptr;
-        return reinterpret_cast<void*>(GetProcAddress(handle, name));
-#else
-        if (!handle) return nullptr;
-        return dlsym(handle, name);
 #endif
     }
 
@@ -289,10 +291,13 @@ NativeLibraryDwgBackend::NativeLibraryDwgBackend(std::filesystem::path library_p
     }
 #endif
 
-    const auto api_version = reinterpret_cast<Impl::ApiVersionFn>(impl_->symbol("cadopt_backend_api_version"));
-    impl_->dxf_to_dwg = reinterpret_cast<Impl::ConvertFn>(impl_->symbol("cadopt_backend_dxf_to_dwg"));
-    impl_->dwg_to_dxf = reinterpret_cast<Impl::ConvertFn>(impl_->symbol("cadopt_backend_dwg_to_dxf"));
-    const auto name_fn = reinterpret_cast<Impl::NameFn>(impl_->symbol("cadopt_backend_name"));
+    const auto api_version = load_native_symbol<Impl::ApiVersionFn>(
+        impl_->handle, "cadopt_backend_api_version");
+    impl_->dxf_to_dwg = load_native_symbol<Impl::ConvertFn>(
+        impl_->handle, "cadopt_backend_dxf_to_dwg");
+    impl_->dwg_to_dxf = load_native_symbol<Impl::ConvertFn>(
+        impl_->handle, "cadopt_backend_dwg_to_dxf");
+    const auto name_fn = load_native_symbol<Impl::NameFn>(impl_->handle, "cadopt_backend_name");
 
     if (!api_version || api_version() != 1) {
         throw std::runtime_error("native DWG backend ABI version mismatch; expected version 1");
