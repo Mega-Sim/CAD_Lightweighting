@@ -50,9 +50,25 @@ if(CADOPT_BUILD_TESTS)
   target_link_libraries(cadopt_search_tests PRIVATE cadopt_core)
   add_test(NAME cadopt_search_tests COMMAND cadopt_search_tests)
 
+  add_library(cadopt_fake_native_backend SHARED tests/fake_native_backend.cpp)
+  target_include_directories(cadopt_fake_native_backend PRIVATE include)
+  set_target_properties(cadopt_fake_native_backend PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
+  )
+  if(MSVC)
+    target_compile_options(cadopt_fake_native_backend PRIVATE /W4 /utf-8)
+  else()
+    target_compile_options(cadopt_fake_native_backend PRIVATE -Wall -Wextra -Wpedantic -finput-charset=UTF-8)
+  endif()
+
   add_executable(cadopt_evaluator_tests tests/test_evaluator.cpp)
   target_link_libraries(cadopt_evaluator_tests PRIVATE cadopt_core)
-  target_compile_definitions(cadopt_evaluator_tests PRIVATE CADOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+  add_dependencies(cadopt_evaluator_tests cadopt_fake_native_backend)
+  target_compile_definitions(cadopt_evaluator_tests PRIVATE
+    CADOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+    CADOPT_TEST_NATIVE_BACKEND_PATH="$<TARGET_FILE:cadopt_fake_native_backend>"
+  )
   add_test(NAME cadopt_evaluator_tests COMMAND cadopt_evaluator_tests)
 endif()
 
