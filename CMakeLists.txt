@@ -10,6 +10,7 @@ add_library(cadopt_core
   src/verifier.cpp
   src/trace.cpp
   src/dwg_backend.cpp
+  src/geometry.cpp
 )
 target_include_directories(cadopt_core PUBLIC include)
 if(MSVC)
@@ -25,6 +26,11 @@ if(CADOPT_BUILD_TESTS)
   target_link_libraries(cadopt_tests PRIVATE cadopt_core)
   target_compile_definitions(cadopt_tests PRIVATE CADOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
   add_test(NAME cadopt_tests COMMAND cadopt_tests)
+
+  add_executable(cadopt_geometry_tests tests/test_geometry.cpp)
+  target_link_libraries(cadopt_geometry_tests PRIVATE cadopt_core)
+  target_compile_definitions(cadopt_geometry_tests PRIVATE CADOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+  add_test(NAME cadopt_geometry_tests COMMAND cadopt_geometry_tests)
 endif()
 
 if(CADOPT_BUILD_GUI)
