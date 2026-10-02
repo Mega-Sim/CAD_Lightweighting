@@ -4,11 +4,13 @@
 #include <cadopt/evaluator.hpp>
 #include <cadopt/geometry.hpp>
 #include <cadopt/search.hpp>
+#include <cadopt/trace.hpp>
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -194,6 +196,37 @@ static void test_plan_aware_quantization_passes_only_inside_geometry_tolerance()
     fs::remove_all(root);
 }
 
+static void test_fatal_trace_blocks_exact_evaluation() {
+    const fs::path input = fs::path(CADOPT_TEST_FIXTURE_DIR) / "minimal.dxf";
+    const auto source = cadopt::DxfDocument::read(input);
+    const auto candidates = cadopt::discover_representation_candidates(
+        cadopt::extract_geometry_views(source));
+    auto plans = one_plan(candidates);
+
+    cadopt::TraceLedger trace;
+    const auto document = trace.begin_entity("document", "DOCUMENT");
+    trace.record(document,
+                 "preflight_failure",
+                 "test=true",
+                 true,
+                 "backend_integrity",
+                 "fatal",
+                 "unresolved fatal condition");
+    require(trace.has_fatal_issue(), "fatal trace test setup failed");
+
+    FakeRoundTripBackend backend;
+    cadopt::StrictSourceMaterializer materializer;
+    cadopt::EvaluationOptions options;
+    options.work_directory = fs::temp_directory_path() / "cadopt_evaluator_fatal_trace";
+    const auto report = cadopt::evaluate_candidate_plans(
+        source, input, candidates, plans, backend, materializer, options, &trace);
+    require(report.winner() == nullptr, "fatal trace must prevent a winning candidate");
+    require(!report.evaluations.empty()
+            && report.evaluations.front().failure_stage == "fatal_trace",
+            "fatal trace must be reported as the rejection stage");
+    fs::remove_all(options.work_directory);
+}
+
 static void test_recompute_winner_uses_actual_dwg_bytes_across_materializers() {
     cadopt::EvaluationReport report;
     cadopt::PlanEvaluation estimated_favorite;
@@ -234,6 +267,7 @@ int main() {
         test_exact_evaluator_accepts_verified_round_trip();
         test_exact_evaluator_rejects_round_trip_semantic_loss();
         test_plan_aware_quantization_passes_only_inside_geometry_tolerance();
+        test_fatal_trace_blocks_exact_evaluation();
         test_recompute_winner_uses_actual_dwg_bytes_across_materializers();
         test_native_backend_missing_library_fails_closed();
         std::cout << "cadopt_evaluator_tests: PASS\n";
