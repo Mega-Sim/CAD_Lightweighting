@@ -41,6 +41,9 @@ public:
                                       const std::filesystem::path& output_dxf) const override;
 };
 
+// Legacy/global research helper retained for isolated experiments. Production
+// research mode uses PlanAwareMaterializer so the selected CandidatePlan owns
+// the transformation that reaches the final DWG evaluator.
 class NumericQuantizationMaterializer final : public CandidateMaterializer {
 public:
     explicit NumericQuantizationMaterializer(double step);
@@ -54,6 +57,15 @@ public:
 
 private:
     double step_{};
+};
+
+class PlanAwareMaterializer final : public CandidateMaterializer {
+public:
+    std::string name() const override { return "plan-aware"; }
+    MaterializationResult materialize(const DxfDocument& source,
+                                      const CandidateSet& candidate_set,
+                                      const CandidatePlan& plan,
+                                      const std::filesystem::path& output_dxf) const override;
 };
 
 struct EvaluationOptions {
