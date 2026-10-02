@@ -13,6 +13,18 @@ Backend profiles identify intended families (`external`, `oda-file-converter`, `
 
 The native ABI version is currently `1` and requires both conversion directions so independent round-trip verification cannot be bypassed.
 
+## Direct DXF and DWG input
+
+The CLI accepts both `.dxf` and `.dwg` source files.
+
+- DXF input enters Source Truth directly.
+- DWG input is first decoded through the configured `DwgBackend::dwg_to_dxf()` path into `<work-dir>/input/normalized_source.dxf`.
+- The customer source DWG is never overwritten.
+- Unsupported extensions, a missing DWG reader, failed conversion, missing normalized output, or an empty normalized output fail closed before optimization begins.
+- For DWG input, the immutable Source Truth used by the optimizer/verifier is the backend-decoded DXF representation. The core does not pretend to parse proprietary DWG bytes itself.
+
+This removes the manual "export to DXF first" step while retaining the same internal verification boundary.
+
 ## Exact evaluator
 
 `evaluate_candidate_plans()` performs, for every evaluated plan:
@@ -46,13 +58,13 @@ Three materializer classes exist:
 
 It deliberately rejects reference/residual/symmetry/grid/grammar/primitive/tensor/wavelet/spectral recipes when using the generic DXF materializer because emitting those directly could change customer-visible CAD selection/edit semantics. Those recipes remain valid search/research representations and may be implemented by a native licensed backend-specific materializer later.
 
-This means M6 now has a real path where candidate values can change serialized DWG bytes, but **it still does not claim a particular compression percentage until a real DWG backend and real DXF input are evaluated**.
+This means M6 now has a real path where candidate values can change serialized DWG bytes, but **it still does not claim a particular compression percentage until a real DWG backend and real customer drawing are evaluated**.
 
 ## CLI research mode
 
-`--research` performs canonical probing, candidate discovery, deterministic C++ search, plan-aware materialization, exact DWG evaluation, independent reverse verification, fatal-trace gate, and winning DWG selection.
+`--research` performs input normalization when required, canonical probing, candidate discovery, deterministic C++ search, plan-aware materialization, exact DWG evaluation, independent reverse verification, fatal-trace gate, and winning DWG selection.
 
-External-command example shape:
+DXF input example:
 
 ```bash
 ./build/cadopt \
@@ -71,7 +83,23 @@ External-command example shape:
   --report build/research_report.json
 ```
 
-The process returns no winner when the backend is unavailable, reverse conversion fails, the reconstructed document fails independent verification, or trace contains an unresolved fatal issue.
+Direct DWG input uses the same command shape; only `--input` changes:
+
+```bash
+./build/cadopt \
+  --input drawing.dwg \
+  --output build/optimized.dwg \
+  --research \
+  --backend-profile external \
+  --dxf-to-dwg 'YOUR_ENCODER {input} {output}' \
+  --dwg-to-dxf 'YOUR_DECODER {input} {output}' \
+  --work-dir build/research \
+  --report build/research_report.json
+```
+
+For a DWG-only dry run, `--dwg-to-dxf` is sufficient because no DWG output is created. Any optimization/round-trip run still requires both conversion directions.
+
+The process returns no winner when the backend is unavailable, input normalization fails, reverse conversion fails, the reconstructed document fails independent verification, or trace contains an unresolved fatal issue.
 
 ## Native SDK host ABI
 
@@ -94,17 +122,18 @@ The optimizer loads those symbols dynamically and still performs its own output 
 
 ## Traceability
 
-M6 preserves the M2 trace model. Canonicalization drift, selected representation candidate, materializer verification failure category, and exact output size are retained in the machine-readable report so later lossy algorithms can be traced back to the exact operation and parameters that caused a difference.
+M6 preserves the M2 trace model. Input kind/normalization, canonicalization drift, selected representation candidate, materializer verification failure category, and exact output size are retained in the machine-readable report so later lossy algorithms can be traced back to the exact operation and parameters that caused a difference.
 
 `TraceLedger::has_fatal_issue()` is a hard acceptance gate. Fatal means the run has a condition that cannot be resolved by candidate scoring; no candidate from that evaluation may become a winner until the fatal condition is removed.
 
 ## What M6 does and does not prove
 
-M6 source implementation provides the end-to-end architecture and the first actually materializable bounded-loss candidate family. It does **not** prove the target drawing is already smaller because this branch has not yet been PR-time built/tested and no licensed DWG backend has been used on the real DXF drawing in this task.
+M6 source implementation provides the end-to-end architecture and the first actually materializable bounded-loss candidate family. Direct DWG input removes the manual pre-export step, but still depends on a real DWG backend.
 
 A compression result is valid only after:
 
-- a real DXF input is supplied;
+- a real DXF or DWG input is supplied;
+- DWG input is successfully normalized by the configured backend;
 - a real backend serializes each candidate to DWG;
 - actual DWG filesystem bytes are measured;
 - the DWG is independently read back;
@@ -113,13 +142,15 @@ A compression result is valid only after:
 
 ## Verification status
 
-Test sources cover:
+The M1-M6 branch was built on Windows with MinGW 13.1 and the pre-direct-DWG-input regression set passed 7/7, followed by a successful CLI dry run on `minimal.dxf`.
 
-- valid and corrupted independent round trips;
-- plan-aware quantization accepted/rejected according to geometry tolerance;
-- fatal trace preventing exact evaluation/winner selection;
-- exact DWG byte precedence over estimated cost;
-- fail-closed missing native backend loading;
-- dynamic loading and two-way conversion through a fake native DLL/SO implementing the same ABI.
+The direct-DWG-input follow-up adds regression source for:
 
-Per project workflow these tests are not executed until a PR is requested.
+- case-insensitive `.dxf` / `.dwg` detection;
+- DXF input bypassing the backend;
+- DWG input failing closed without a reader;
+- backend-driven DWG→DXF normalization inside the work directory;
+- preservation of the original DWG bytes during normalization;
+- unsupported input extensions failing closed.
+
+Per project workflow, the new follow-up test is not executed until a PR is requested.
