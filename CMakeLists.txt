@@ -17,6 +17,9 @@ add_library(cadopt_core
   src/evaluator.cpp
 )
 target_include_directories(cadopt_core PUBLIC include)
+if(CMAKE_DL_LIBS)
+  target_link_libraries(cadopt_core PRIVATE ${CMAKE_DL_LIBS})
+endif()
 if(MSVC)
   target_compile_options(cadopt_core PRIVATE /W4 /utf-8)
 else()
