@@ -44,9 +44,21 @@ def _has_overlap(candidate_set: dict, indices: Sequence[int]) -> bool:
     return False
 
 
+def _declared_conflict(candidate_set: dict, indices: Sequence[int]) -> bool:
+    selected_ids = {
+        candidate_set["candidates"][index].get("id", str(index))
+        for index in indices
+    }
+    for index in indices:
+        candidate = candidate_set["candidates"][index]
+        if any(conflict in selected_ids for conflict in candidate.get("conflicts", [])):
+            return True
+    return False
+
+
 def complete_with_raw(candidate_set: dict, non_raw_indices: Iterable[int]) -> SearchPlan | None:
     selected = sorted(set(non_raw_indices))
-    if _has_overlap(candidate_set, selected):
+    if _has_overlap(candidate_set, selected) or _declared_conflict(candidate_set, selected):
         return None
     universe = list(candidate_set.get("source_universe", []))
     raw = _raw_by_source(candidate_set)
@@ -62,6 +74,8 @@ def complete_with_raw(candidate_set: dict, non_raw_indices: Iterable[int]) -> Se
     if covered != set(universe):
         return None
     selected = sorted(set(selected))
+    if _declared_conflict(candidate_set, selected):
+        return None
     cost = sum(float(candidate_set["candidates"][i].get("estimated_bytes", 0.0)) for i in selected)
     return SearchPlan(tuple(selected), cost)
 
@@ -89,17 +103,41 @@ def _mutate(candidate_set: dict, state: set[int], rng: random.Random) -> set[int
         result.remove(chosen)
     else:
         candidate_sources = set(candidate_set["candidates"][chosen].get("source_ids", []))
-        conflicts = {
-            index
-            for index in result
-            if candidate_sources.intersection(candidate_set["candidates"][index].get("source_ids", []))
-        }
+        chosen_id = candidate_set["candidates"][chosen].get("id", str(chosen))
+        chosen_conflicts = set(candidate_set["candidates"][chosen].get("conflicts", []))
+        conflicts = set()
+        for index in result:
+            existing = candidate_set["candidates"][index]
+            existing_sources = set(existing.get("source_ids", []))
+            existing_id = existing.get("id", str(index))
+            existing_conflicts = set(existing.get("conflicts", []))
+            if candidate_sources.intersection(existing_sources):
+                conflicts.add(index)
+            elif existing_id in chosen_conflicts or chosen_id in existing_conflicts:
+                conflicts.add(index)
         result.difference_update(conflicts)
         result.add(chosen)
     return result
 
 
-def simulated_annealing(candidate_set: dict, *, iterations: int = 5000, seed: int = 0) -> SearchPlan:
+def simulated_annealing(
+    candidate_set: dict,
+    *,
+    iterations: int = 5000,
+    seed: int = 0,
+    initial_temperature_fraction: float = 0.05,
+    final_temperature_fraction: float = 1.0e-6,
+) -> SearchPlan:
+    """Search estimated-byte space with a cost-scaled annealing schedule.
+
+    Temperature is expressed as a fraction of the raw exact-cover cost so an
+    uphill move of tens/hundreds of estimated bytes can actually be accepted
+    early in the run. This remains a search heuristic only; final DWG bytes are
+    measured and validated by C++ M6.
+    """
+    if initial_temperature_fraction <= 0.0 or final_temperature_fraction <= 0.0:
+        raise ValueError("temperature fractions must be positive")
+
     rng = random.Random(seed)
     state: set[int] = set()
     current = complete_with_raw(candidate_set, state)
@@ -107,17 +145,31 @@ def simulated_annealing(candidate_set: dict, *, iterations: int = 5000, seed: in
         raise ValueError("candidate set has no raw exact-cover fallback")
     best = current
 
-    for step in range(max(1, iterations)):
+    raw_scale = max(1.0, current.estimated_bytes)
+    start_temperature = max(1.0e-12, raw_scale * initial_temperature_fraction)
+    end_temperature = max(1.0e-12, raw_scale * final_temperature_fraction)
+    steps = max(1, iterations)
+
+    for step in range(steps):
         proposal_state = _mutate(candidate_set, state, rng)
         proposal = complete_with_raw(candidate_set, proposal_state)
         if proposal is None:
             continue
-        temperature = max(1e-9, 1.0 - step / max(1, iterations))
+
+        progress = step / max(1, steps - 1)
+        # Geometric cooling keeps the schedule scale-invariant.
+        temperature = start_temperature * ((end_temperature / start_temperature) ** progress)
         delta = proposal.estimated_bytes - current.estimated_bytes
-        if delta <= 0.0 or rng.random() < math.exp(-delta / max(temperature, 1e-9)):
+        if delta <= 0.0 or rng.random() < math.exp(-delta / max(temperature, 1.0e-12)):
             state = proposal_state
             current = proposal
-        if current.estimated_bytes < best.estimated_bytes:
+        if (
+            current.estimated_bytes < best.estimated_bytes
+            or (
+                current.estimated_bytes == best.estimated_bytes
+                and current.candidate_indices < best.candidate_indices
+            )
+        ):
             best = current
     return best
 
@@ -143,8 +195,10 @@ def genetic_search(
         rng.shuffle(shuffled)
         for index in shuffled:
             if rng.random() < 0.35:
-                sources = set(candidate_set["candidates"][index].get("source_ids", []))
-                if any(sources.intersection(candidate_set["candidates"][other].get("source_ids", [])) for other in state):
+                proposal = set(state)
+                proposal.add(index)
+                plan = complete_with_raw(candidate_set, proposal)
+                if plan is None:
                     continue
                 state.add(index)
         return state
@@ -158,20 +212,27 @@ def genetic_search(
             if plan is None:
                 continue
             scored.append((plan.estimated_bytes, state, plan))
-            if plan.estimated_bytes < best.estimated_bytes:
+            if (
+                plan.estimated_bytes < best.estimated_bytes
+                or (
+                    plan.estimated_bytes == best.estimated_bytes
+                    and plan.candidate_indices < best.candidate_indices
+                )
+            ):
                 best = plan
         if not scored:
             population = [random_state() for _ in range(max(2, population_size))]
             continue
         scored.sort(key=lambda item: (item[0], tuple(sorted(item[1]))))
-        elite_count = max(2, min(len(scored), population_size // 4))
+        elite_count = max(2, min(len(scored), max(2, population_size // 4)))
         elites = [set(item[1]) for item in scored[:elite_count]]
         next_population = elites[:]
-        while len(next_population) < population_size:
+        while len(next_population) < max(2, population_size):
             a = rng.choice(elites)
             b = rng.choice(elites)
             child = set(index for index in a.union(b) if rng.random() < 0.5)
-            # Repair overlap deterministically by lower estimated cost per covered source.
+            # Repair by adding candidates in low estimated-cost-per-source order,
+            # accepting only states that still admit an exact raw fallback.
             ordered = sorted(
                 child,
                 key=lambda idx: (
@@ -181,15 +242,15 @@ def genetic_search(
                 ),
             )
             repaired: set[int] = set()
-            used: set[str] = set()
             for index in ordered:
-                sources = set(candidate_set["candidates"][index].get("source_ids", []))
-                if used.intersection(sources):
-                    continue
-                repaired.add(index)
-                used.update(sources)
+                proposal = set(repaired)
+                proposal.add(index)
+                if complete_with_raw(candidate_set, proposal) is not None:
+                    repaired = proposal
             if rng.random() < 0.35:
                 repaired = _mutate(candidate_set, repaired, rng)
+                if complete_with_raw(candidate_set, repaired) is None:
+                    repaired = set()
             next_population.append(repaired)
         population = next_population
     return best
