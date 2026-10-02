@@ -1,72 +1,139 @@
 # GigaRoute CAD Optimizer
 
-Research-first DXF → DWG minimization engine. The customer-facing objective is simple: **minimize the final DWG byte size while preserving the drawing as the same CAD document in practical use**.
+Research-first **DXF → DWG lightweighting engine**. The product objective is intentionally simple: **minimize the actual final DWG byte size while making the output behave like the same CAD document in customer use**.
 
 ## Fixed product constraints
 
-- Input: DXF.
-- Output: DWG.
-- Core languages: C++ + Python.
-- Intermediate representation is unrestricted: rotation/translation/coordinate normalization, temporary grouping, tensor/wavelet/graph/latent/compressed representations, and lossy candidates are allowed internally.
-- Final output must restore CAD behavior, not only appearance. If source lines are individually selectable, the output must not silently turn them into a newly created block/group.
-- Intermediate merging/blocking is allowed only if final reconstruction restores the original customer-visible selection/edit semantics.
-- Optimization time is secondary to finding the smallest valid final DWG during the research phase.
-- Final objective: actual output DWG bytes. Intermediate compression ratios are diagnostics only.
-- Loss/difference traceability is a first-class requirement from the beginning.
+- Input: **DXF**.
+- Output: **DWG**.
+- Core languages: **C++20 + Python 3**.
+- Intermediate representation is unrestricted: coordinate translation, XYZ rotation, axis changes, uniform normalization, temporary grouping, reference/residual representations, grammar/grid forms, tensor/wavelet/spectral probes, compression, and future lossy candidates are allowed internally.
+- Final output must preserve more than appearance. Geometry, CAD semantics, selection units, block/group/reference relationships, and practical edit behavior are verification constraints.
+- Temporary merging/blocking is allowed only inside the optimizer; if source lines were individually selectable, the final output must restore equivalent individual selection/edit units.
+- Absolute coordinates are low-priority inside the optimizer; physical shape/relative relationships and exact reconstruction are authoritative.
+- Research runtime is secondary to finding the smallest valid result.
+- **Final objective = actual serialized DWG filesystem bytes.** Intermediate compression/description-length estimates are search hints only.
+- Loss/difference traceability is a first-class requirement.
+- UI stays intentionally minimal. Current development is core/CLI first.
 
-## Milestone 1 implemented scope
+## Development branch
 
-Milestone 1 establishes the zero-optimization safety baseline:
+Current branch: `feature/milestone-2-loss-trace`
 
-1. ASCII DXF is ingested as an immutable lexical source plus an entity semantic index.
-2. The source can be emitted byte-for-byte in `PreserveLexical` mode.
-3. ENTITIES selection units are indexed with stable source IDs, type, handle, layer, and source record spans.
-4. The CLI supports a strict zero-optimization DXF round trip.
-5. DWG conversion is isolated behind a backend boundary. In this repository the production backend is an external-command adapter so RealDWG/ODA or another licensed writer can be connected without contaminating geometry truth or search logic.
-6. For a real DXF→DWG run, the CLI requires both DXF→DWG and DWG→DXF commands. The generated DWG is converted back to DXF and independently compared before the run can pass.
+Tracked issues:
 
-## Milestone 2 implemented branch scope
+- #1 — M2 loss/difference trace and richer semantic verification
+- #2 — M3 reversible canonical transforms and exact reconstruction
+- #3 — M4 representation discovery and lightweighting candidate engine
+- #4 — M5 multi-method search and black-box size optimization
+- #5 — M6 production DWG backend, exact byte objective, and end-to-end validation
 
-Development branch: `feature/milestone-2-loss-trace`  
-Issue: #1
+The branch was created from the then-current `main`. Development is based on the current repository code, not historical UI/code snapshots.
 
-1. DXF indexing includes BLOCK definitions, OBJECTS records, INSERT targets, GROUP member references, and XDATA application ownership.
-2. Verification separates geometry, semantic, interaction, reference, block/object, and XDATA loss categories.
-3. Geometry comparison for LINE/ARC/CIRCLE/LWPOLYLINE/TEXT normalizes numeric representation and applies explicit tolerances.
-4. Selection/edit behavior is a hard constraint: entity count/type, INSERT target, BLOCK definition, and GROUP membership changes fail verification.
-5. Every verification issue carries severity/category/detail and optional numeric metrics.
-6. Verification failures are correlated back into the source trace ledger.
-7. Source Truth remains immutable.
+## Milestone status
 
-## Milestone 3 source implementation
+### M1 — zero-optimization safety baseline
 
-Issue: #2
+Implemented and user-verified on Linux:
 
-Milestone 3 introduces the reversible optimization-space math layer:
+- lexical-preserving ASCII DXF parser
+- immutable Source Truth
+- stable ENTITIES selection-unit index
+- byte-preserving DXF round trip
+- fail-closed external DWG backend boundary
+- minimal Qt file-picker shell
 
-1. `Vec3` / affine `Mat4` geometry primitives.
-2. Reversible translation, XYZ rotation, signed axis permutation, and uniform scale.
-3. Explicit affine inverse calculation and round-trip drift measurement.
-4. Non-destructive geometry views for LINE, ARC, CIRCLE, LWPOLYLINE, and TEXT.
-5. Unsupported/incomplete entity geometry remains explicit and cannot silently pass as supported geometry.
-6. Canonicalization recenters and aligns geometry for later representation discovery while preserving an inverse transform back to the source coordinate frame.
-7. Canonical views are intermediate-only; customer-facing entity units are reconstructed before final DWG serialization.
+The initial user run passed CTest and the three-entity LINE/ARC/TEXT dry-run.
 
-M3 test source is included but, per project workflow, build/regression execution is deferred until a PR is requested.
+### M2 — loss/difference trace and semantic verification
 
-## Current deliberate limitation
+Source implementation on the development branch:
 
-This repository does **not** ship Autodesk RealDWG or ODA binaries/licenses. True DWG round-trip verification becomes active only when a licensed/installed backend is supplied through the backend interface/CLI command templates.
+- BLOCK definitions, OBJECTS, INSERT targets, GROUP references, XDATA application ownership
+- geometry/semantic/interaction/reference loss categories
+- normalized numeric geometry comparison for LINE/ARC/CIRCLE/LWPOLYLINE/TEXT
+- hard selection/edit constraints for entity count/type and structure
+- source-correlated trace records with severity, category, detail, and numeric metrics
 
-The current development branch contains M2/M3 source implementations but is not claimed as build-verified until PR-time verification is requested.
+### M3 — reversible canonical transform core
+
+Source implementation:
+
+- `Vec3` / affine `Mat4`
+- reversible translation, XYZ rotation, signed axis permutation, uniform scale
+- explicit affine inverse and round-trip drift measurement
+- non-destructive geometry views
+- canonical recenter/alignment for representation discovery
+- unsupported/incomplete entities remain explicit and fail safe
+
+See `docs/MILESTONE_3.md`.
+
+### M4 — representation discovery and candidate engine
+
+Source implementation:
+
+- global/structural/local scopes are all allowed; no single scope is privileged
+- raw source fallback
+- transform-invariant exact-repeat signatures
+- reference + transform candidates
+- near-repeat reference + residual candidates
+- grid / repeated sequence / grammar probes
+- whole-drawing structural estimate
+- dependency-free Python tensor/wavelet/spectral suitability probes
+- candidate provenance, exact source coverage, reconstruction recipe, estimated bytes, residual estimate, and loss risk
+
+See `docs/MILESTONE_4.md`.
+
+### M5 — multi-method search
+
+Source implementation:
+
+- exact-cover structural validity: each source entity must be represented exactly once
+- deterministic greedy search
+- bounded exhaustive search
+- beam search fallback
+- Python deterministic-seed simulated annealing
+- Python deterministic-seed genetic search
+- QUBO exact-cover export for optional quantum-inspired solvers
+- append-only JSONL experiment records
+- strict separation between `estimated_bytes` and `exact_dwg_bytes`
+
+**Actual DWG bytes always outrank estimated cost.** Quantum-inspired search is one competitor, not a hard-coded winner.
+
+See `docs/MILESTONE_5.md`.
+
+### M6 — exact DWG evaluator and end-to-end selection
+
+Source implementation:
+
+- backend capability/profile model: external command / ODA File Converter / ODA SDK host / RealDWG host
+- proprietary backend binaries are **not** bundled
+- converter templates must contain both `{input}` and `{output}` and fail closed on missing/stale/empty output
+- candidate materializer boundary
+- real DWG filesystem byte measurement
+- independent DWG → DXF reverse conversion
+- independent geometry + semantic + interaction verification
+- smallest verified DWG winner selection
+- `--research` CLI path: canonical probe → candidate discovery → search → exact DWG evaluation → reverse verification → winner copy
+- machine-readable candidate/search/evaluation/trace report
+
+See `docs/MILESTONE_6.md`.
+
+## Important current limitation
+
+M3-M6 are currently **source implementations, not yet PR-time build/regression verified**. Per project workflow, build/test execution is deferred until a PR is requested. The test source and verification checklist are already included.
+
+The first M6 materializer is intentionally `StrictSourceMaterializer`: it reconstructs the original source entity units exactly before serialization. This proves the full safety and black-box evaluation loop, but it also means **the M4/M5 structural compression estimates are not yet a claim of measured DWG reduction**. A later source-equivalent optimized materializer must actually alter native CAD serialization, pass the same interaction/semantic gate, and then prove a smaller DWG byte count.
+
+Also, this repository does not ship Autodesk RealDWG or ODA SDK/converter binaries. Real DWG evaluation requires a separately installed/licensed backend supplied through explicit command templates.
 
 ## Build
 
-Linux/macOS:
+Linux:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 2
+cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
@@ -78,50 +145,62 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
-## Zero-optimization dry run
+## Strict dry run
 
 ```bash
 ./build/cadopt \
   --input tests/fixtures/minimal.dxf \
   --dry-run \
-  --report build/m2_report.json
+  --report build/dry_run_report.json
 ```
 
-## Real DWG round trip
+## One-shot real DWG round trip
 
-After installing/licensing a DWG converter/writer, provide commands containing both `{input}` and `{output}` placeholders:
+Backend command syntax depends on the separately installed backend; do not substitute guessed syntax.
 
 ```bash
 ./build/cadopt \
   --input drawing.dxf \
-  --output drawing.dwg \
-  --dxf-to-dwg 'YOUR_DXF_TO_DWG_COMMAND {input} {output}' \
-  --dwg-to-dxf 'YOUR_DWG_TO_DXF_COMMAND {input} {output}' \
-  --report cadopt_report.json
+  --output build/roundtrip.dwg \
+  --backend-profile external \
+  --dxf-to-dwg 'INSTALLED_ENCODER_COMMAND {input} {output}' \
+  --dwg-to-dxf 'INSTALLED_DECODER_COMMAND {input} {output}' \
+  --report build/roundtrip_report.json
 ```
 
-A run is rejected if the independent geometry/semantic/interaction verifier fails.
+## M3-M6 research mode
+
+```bash
+./build/cadopt \
+  --input drawing.dxf \
+  --output build/optimized.dwg \
+  --research \
+  --backend-profile external \
+  --dxf-to-dwg 'INSTALLED_ENCODER_COMMAND {input} {output}' \
+  --dwg-to-dxf 'INSTALLED_DECODER_COMMAND {input} {output}' \
+  --max-plans 16 \
+  --beam-width 64 \
+  --work-dir build/research \
+  --report build/research_report.json
+```
+
+No winner is accepted if backend conversion fails, reverse conversion fails, or geometry/semantic/interaction verification fails.
 
 ## Repository layout
 
 ```text
 include/cadopt/       C++ public interfaces
-src/                  source truth, geometry, verifier, trace, DWG backend, CLI
-app/minimal_qt/       optional file-picker-only Qt shell
-python/cadopt_lab/    research/search layer; source geometry remains C++ owned
-tests/                regression fixtures/tests
-docs/                 decisions, milestone notes, design and implementation plans
+src/                  Source Truth, geometry, candidate/search/evaluator, verifier, trace, DWG backend, CLI
+python/cadopt_lab/    experimental probes/search/QUBO/experiment records
+app/minimal_qt/       optional file-picker-only shell
+tests/                regression test sources and fixtures
+docs/                 decisions, milestone notes, architecture/implementation plan, PR verification checklist
 ```
 
-## Active development
+## Verification checklist
 
-- #1 M2 loss/difference trace and richer semantic verification.
-- #2 M3 reversible canonical transforms and exact reconstruction.
-- #3 M4 representation discovery and lightweighting candidate engine.
-- #4 M5 multi-method search and black-box size optimization.
-- #5 M6 production DWG backend, exact byte objective, and end-to-end validation.
-- Branch: `feature/milestone-2-loss-trace`.
+See `docs/M3_M6_VERIFICATION.md` for the PR-time Linux build/test/dry-run/fail-closed/real-backend verification sequence.
 
-## Roadmap
+## Reference drawing
 
-M4 adds global/structural/local representation discovery and candidate recipes. M5 adds competing long-running search methods and experiment persistence. M6 serializes candidates through a real DWG backend, independently round-trips them back to DXF, and chooses the smallest candidate that passes geometry + semantic + interaction verification.
+The repository includes `7F.dwg` as a reference drawing. Product input remains DXF, so a corresponding DXF export is required before end-to-end optimizer evaluation. Renaming a DWG or archive as DXF/DWG is never treated as a valid conversion or product output.
