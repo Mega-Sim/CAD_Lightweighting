@@ -3,6 +3,7 @@
 #include <cadopt/dxf.hpp>
 #include <cadopt/evaluator.hpp>
 #include <cadopt/geometry.hpp>
+#include <cadopt/input.hpp>
 #include <cadopt/search.hpp>
 #include <cadopt/trace.hpp>
 #include <cadopt/verifier.hpp>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -93,6 +95,59 @@ static cadopt::VerificationOptions verification_options(const Options& options) 
     return result;
 }
 
+static fs::path effective_work_directory(const Options& options) {
+    return options.work_directory.empty()
+        ? fs::temp_directory_path() / "cadopt_m6"
+        : options.work_directory;
+}
+
+static bool same_target_path(const fs::path& a, const fs::path& b) {
+    if (a.empty() || b.empty()) return false;
+    std::error_code error;
+    const bool a_exists = fs::exists(a, error) && !error;
+    error.clear();
+    const bool b_exists = fs::exists(b, error) && !error;
+    if (a_exists && b_exists) {
+        error.clear();
+        if (fs::equivalent(a, b, error) && !error) return true;
+    }
+    error.clear();
+    const auto aa = fs::absolute(a, error).lexically_normal();
+    if (error) return false;
+    error.clear();
+    const auto bb = fs::absolute(b, error).lexically_normal();
+    return !error && aa == bb;
+}
+
+static std::unique_ptr<cadopt::DwgBackend> configure_backend(const Options& options,
+                                                             bool need_read_dwg,
+                                                             bool need_write_dwg,
+                                                             std::string& error) {
+    if (!need_read_dwg && !need_write_dwg) return {};
+    if (need_read_dwg && options.dwg_to_dxf.empty()) {
+        error = "DWG input/verification requires --dwg-to-dxf";
+        return {};
+    }
+    if (need_write_dwg && options.dxf_to_dwg.empty()) {
+        error = "DWG output requires --dxf-to-dwg";
+        return {};
+    }
+
+    const auto profile = cadopt::parse_dwg_backend_profile(options.backend_profile);
+    auto backend = std::make_unique<cadopt::ExternalCommandDwgBackend>(
+        options.dxf_to_dwg, options.dwg_to_dxf, profile);
+    const auto caps = backend->capabilities();
+    if (need_read_dwg && !caps.can_read_dwg) {
+        error = "configured backend cannot read DWG: " + caps.name;
+        return {};
+    }
+    if (need_write_dwg && !caps.can_write_dwg) {
+        error = "configured backend cannot write DWG: " + caps.name;
+        return {};
+    }
+    return backend;
+}
+
 static Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
@@ -124,19 +179,19 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--research" || a == "--optimize") o.research = true;
         else if (a == "--help" || a == "-h") {
             std::cout
-                << "cadopt --input input.dxf --output output.dwg [options]\n"
-                << "  --dry-run                 Strict DXF -> IR -> DXF safety check only\n"
+                << "cadopt --input input.dxf|input.dwg --output output.dwg [options]\n"
+                << "  --dry-run                 Strict source -> DXF IR -> DXF safety check; DWG input is decoded first\n"
                 << "  --research                Discover/search/materialize/evaluate representation plans\n"
                 << "  --backend-profile NAME    external|oda-file-converter|oda-sdk|realdwg-host\n"
                 << "  --dxf-to-dwg CMD          Converter command template with {input} and {output}\n"
-                << "  --dwg-to-dxf CMD          Independent reverse command with {input} and {output}\n"
+                << "  --dwg-to-dxf CMD          DWG input/reverse command with {input} and {output}\n"
                 << "  --max-plans N             Maximum exact DWG candidate evaluations (default 16; 0=all)\n"
                 << "  --beam-width N            Beam width for broad candidate search (default 64)\n"
                 << "  --geometry-abs-tol V      Absolute geometry verification tolerance (default 1e-9)\n"
                 << "  --geometry-rel-tol V      Relative geometry verification tolerance (default 1e-9)\n"
                 << "  --quantize-steps CSV      Whole-drawing numeric quantization probes\n"
                 << "                           (default 1e-10,5e-10,1e-9)\n"
-                << "  --work-dir DIR            Candidate artifact directory\n"
+                << "  --work-dir DIR            Input/candidate artifact directory\n"
                 << "  --cleanup-artifacts       Remove non-winning candidate artifacts\n"
                 << "  --report FILE             Machine-readable JSON report\n";
             std::exit(0);
@@ -146,6 +201,9 @@ static Options parse_args(int argc, char** argv) {
     }
     if (o.input.empty()) throw std::runtime_error("--input is required");
     if (!o.dry_run && o.output.empty()) throw std::runtime_error("--output is required unless --dry-run");
+    if (!o.dry_run && cadopt::detect_cad_input_kind(o.output) != cadopt::CadInputKind::Dwg) {
+        throw std::runtime_error("--output must use the .dwg extension");
+    }
     return o;
 }
 
@@ -354,16 +412,9 @@ static void trace_winner(const cadopt::EvaluationReport& evaluation,
 
 static int run_research(const Options& opt,
                         const cadopt::DxfDocument& source,
+                        const fs::path& source_dxf_path,
+                        cadopt::DwgBackend& backend,
                         cadopt::TraceLedger& trace) {
-    if (opt.dxf_to_dwg.empty() || opt.dwg_to_dxf.empty()) {
-        cadopt::VerificationReport empty;
-        empty.pass = false;
-        write_basic_report(opt.report, empty, trace, "research_exact_dwg_search",
-                           "converter_not_configured");
-        std::cerr << "[CADOPT][M6] research mode requires both converter commands\n";
-        return 4;
-    }
-
     const auto views = cadopt::extract_geometry_views(source);
     trace_canonical_views(views, trace);
 
@@ -387,18 +438,14 @@ static int run_research(const Options& opt,
               << " candidates=" << candidates.candidates.size() << '\n';
     std::cout << "[CADOPT][M5] search/evaluation plans=" << plans.size() << '\n';
 
-    const auto profile = cadopt::parse_dwg_backend_profile(opt.backend_profile);
-    cadopt::ExternalCommandDwgBackend backend(opt.dxf_to_dwg, opt.dwg_to_dxf, profile);
     cadopt::PlanAwareMaterializer materializer;
     cadopt::EvaluationOptions evaluation_options;
-    evaluation_options.work_directory = opt.work_directory.empty()
-        ? fs::temp_directory_path() / "cadopt_m6_research"
-        : opt.work_directory;
+    evaluation_options.work_directory = effective_work_directory(opt) / "research";
     evaluation_options.max_plans = opt.max_plans;
     evaluation_options.keep_artifacts = opt.keep_artifacts;
     evaluation_options.verification = verification_options(opt);
 
-    auto evaluation = cadopt::evaluate_candidate_plans(source, opt.input, candidates, plans,
+    auto evaluation = cadopt::evaluate_candidate_plans(source, source_dxf_path, candidates, plans,
                                                         backend, materializer,
                                                         evaluation_options, &trace);
     trace_winner(evaluation, plans, candidates, trace);
@@ -422,7 +469,34 @@ static int run_research(const Options& opt,
 int main(int argc, char** argv) {
     try {
         const auto opt = parse_args(argc, argv);
-        const auto source = cadopt::DxfDocument::read(opt.input);
+        if (!opt.dry_run && same_target_path(opt.input, opt.output)) {
+            throw std::runtime_error("refusing to overwrite the source CAD input; choose a different --output path");
+        }
+
+        const auto input_kind = cadopt::detect_cad_input_kind(opt.input);
+        const bool need_read_dwg = input_kind == cadopt::CadInputKind::Dwg || !opt.dry_run;
+        const bool need_write_dwg = !opt.dry_run;
+        std::string backend_error;
+        auto backend = configure_backend(opt, need_read_dwg, need_write_dwg, backend_error);
+        if ((need_read_dwg || need_write_dwg) && !backend) {
+            std::cerr << "[CADOPT][BACKEND] " << backend_error << '\n';
+            return 4;
+        }
+
+        const auto prepared = cadopt::prepare_input_as_dxf(
+            opt.input, effective_work_directory(opt), backend.get());
+        if (!prepared.ok) {
+            std::cerr << "[CADOPT][INPUT] " << prepared.message << '\n';
+            return 4;
+        }
+        if (prepared.converted_from_dwg) {
+            std::cout << "[CADOPT][INPUT] DWG normalized to " << prepared.dxf_path
+                      << " bytes=" << prepared.conversion.output_bytes << '\n';
+        } else {
+            std::cout << "[CADOPT][INPUT] DXF source=" << prepared.dxf_path << '\n';
+        }
+
+        const auto source = cadopt::DxfDocument::read(prepared.dxf_path);
         std::cout << "[CADOPT] source indexed: entities=" << source.entities().size()
                   << " blocks=" << source.blocks().size()
                   << " objects=" << source.objects().size()
@@ -430,8 +504,18 @@ int main(int argc, char** argv) {
 
         cadopt::TraceLedger trace;
         seed_trace(source, trace);
+        trace.record_for_source("document",
+                                "input_normalization",
+                                "input_kind=" + cadopt::cad_input_kind_name(prepared.kind)
+                                    + ";converted_from_dwg="
+                                    + (prepared.converted_from_dwg ? "true" : "false"),
+                                false,
+                                "none",
+                                "info",
+                                prepared.message);
 
-        const fs::path staged = fs::temp_directory_path() / "cadopt_safety_staged.dxf";
+        const fs::path staged = effective_work_directory(opt) / "safety" / "staged_source.dxf";
+        fs::create_directories(staged.parent_path());
         source.write(staged, cadopt::DxfWriteMode::PreserveLexical);
         const auto staged_doc = cadopt::DxfDocument::read(staged);
         auto report = cadopt::verify_semantic_equivalence(source, staged_doc,
@@ -445,31 +529,25 @@ int main(int argc, char** argv) {
         std::cout << "[CADOPT] zero-optimization DXF round-trip verified\n";
 
         if (opt.dry_run) {
-            write_basic_report(opt.report, report, trace, "dxf_roundtrip", "dry_run");
+            write_basic_report(opt.report, report, trace, "dxf_roundtrip",
+                               prepared.converted_from_dwg ? "dry_run_from_dwg" : "dry_run_from_dxf");
             std::cout << "Dry-run PASS: " << source.entities().size()
                       << " selection units preserved. Report: " << opt.report << '\n';
             return 0;
         }
 
-        if (opt.research) return run_research(opt, source, trace);
+        if (opt.research) return run_research(opt, source, prepared.dxf_path, *backend, trace);
 
-        if (opt.dxf_to_dwg.empty() || opt.dwg_to_dxf.empty()) {
-            write_basic_report(opt.report, report, trace, "dwg_roundtrip", "converter_not_configured");
-            std::cerr << "DWG backend is not configured. Both converter commands are required\n";
-            return 4;
-        }
-
-        const auto profile = cadopt::parse_dwg_backend_profile(opt.backend_profile);
-        cadopt::ExternalCommandDwgBackend backend(opt.dxf_to_dwg, opt.dwg_to_dxf, profile);
-        const auto encode = backend.dxf_to_dwg(staged, opt.output);
+        const auto encode = backend->dxf_to_dwg(staged, opt.output);
         if (!encode.ok) {
             write_basic_report(opt.report, report, trace, "dwg_roundtrip", encode.message);
             std::cerr << "DXF->DWG failed: " << encode.message << '\n';
             return 5;
         }
 
-        const fs::path verify_dxf = fs::temp_directory_path() / "cadopt_verify.dxf";
-        const auto decode = backend.dwg_to_dxf(opt.output, verify_dxf);
+        const fs::path verify_dxf = effective_work_directory(opt) / "verify" / "roundtrip.dxf";
+        fs::create_directories(verify_dxf.parent_path());
+        const auto decode = backend->dwg_to_dxf(opt.output, verify_dxf);
         if (!decode.ok) {
             write_basic_report(opt.report, report, trace, "dwg_roundtrip", decode.message);
             std::cerr << "DWG->DXF verification conversion failed: " << decode.message << '\n';
