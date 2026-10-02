@@ -73,15 +73,17 @@ bool quantizable_geometry_code(const std::string& type, int code) {
             || code == 11 || code == 21 || code == 31;
     }
     if (type == "ARC" || type == "CIRCLE") {
+        // Start/end angles remain exact in the first lossy path.
         return code == 10 || code == 20 || code == 30 || code == 40;
     }
     if (type == "LWPOLYLINE") {
-        // Keep bulge (42) and angular/dimensionless fields exact in the first lossy path.
+        // Keep bulge (42) and angular/dimensionless fields exact.
         return code == 10 || code == 20 || code == 38 || code == 39
             || code == 40 || code == 41 || code == 43;
     }
     if (type == "TEXT") {
-        // Keep angle/oblique/width-factor values exact. Quantize coordinates and text height only.
+        // Keep rotation/oblique/width-factor values exact. Quantize only
+        // coordinates and text height.
         return code == 10 || code == 20 || code == 30
             || code == 11 || code == 21 || code == 31 || code == 40;
     }
@@ -93,6 +95,53 @@ std::string format_quantized(double value) {
     std::ostringstream out;
     out << std::setprecision(17) << std::defaultfloat << value;
     return out.str();
+}
+
+MaterializationResult write_quantized_dxf(
+    const DxfDocument& source,
+    const std::unordered_set<std::string>& source_ids,
+    double step,
+    const std::filesystem::path& output_dxf,
+    const std::string& label) {
+
+    if (!std::isfinite(step) || step <= 0.0) {
+        return {false, "numeric quantization step must be finite and positive", {}};
+    }
+
+    std::unordered_set<std::size_t> quantizable_records;
+    for (const auto& entity : source.entities()) {
+        if (!source_ids.empty() && !source_ids.contains(entity.source_id)) continue;
+        for (std::size_t index = entity.first_record;
+             index < entity.last_record_exclusive && index < source.records().size(); ++index) {
+            if (quantizable_geometry_code(entity.type, source.records()[index].code)) {
+                quantizable_records.insert(index);
+            }
+        }
+    }
+
+    std::ofstream out(output_dxf, std::ios::binary | std::ios::trunc);
+    if (!out) return {false, "unable to create quantized DXF: " + output_dxf.string(), {}};
+
+    const auto& records = source.records();
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        const auto& record = records[index];
+        out << record.raw_code_line << '\n';
+        if (!quantizable_records.contains(index)) {
+            out << record.raw_value_line << '\n';
+            continue;
+        }
+
+        double value = 0.0;
+        if (!parse_double(record.value, value)) {
+            out << record.raw_value_line << '\n';
+            continue;
+        }
+        const double quantized = std::round(value / step) * step;
+        out << format_quantized(quantized) << '\n';
+    }
+    out.flush();
+    if (!out) return {false, "failed while writing quantized DXF", {}};
+    return {true, label, output_dxf};
 }
 
 void trace_materializer_issues(TraceLedger& trace,
@@ -169,39 +218,75 @@ MaterializationResult NumericQuantizationMaterializer::materialize(
         return {false, validation_error, {}};
     }
 
-    std::unordered_set<std::size_t> quantizable_records;
-    for (const auto& entity : source.entities()) {
-        for (std::size_t index = entity.first_record;
-             index < entity.last_record_exclusive && index < source.records().size(); ++index) {
-            if (quantizable_geometry_code(entity.type, source.records()[index].code)) {
-                quantizable_records.insert(index);
+    return write_quantized_dxf(source, {}, step_, output_dxf, name());
+}
+
+MaterializationResult PlanAwareMaterializer::materialize(
+    const DxfDocument& source,
+    const CandidateSet& candidate_set,
+    const CandidatePlan& plan,
+    const std::filesystem::path& output_dxf) const {
+
+    std::string validation_error;
+    if (!plan_is_materializable(candidate_set, plan, validation_error)) {
+        return {false, validation_error, {}};
+    }
+
+    std::unordered_set<std::string> quantized_sources;
+    double quantization_step = 0.0;
+    bool has_quantization = false;
+
+    for (const auto index : plan.candidate_indices) {
+        const auto& candidate = candidate_set.candidates[index];
+        switch (candidate.kind) {
+        case CandidateKind::Raw:
+            break;
+        case CandidateKind::NumericQuantization:
+            if (!std::isfinite(candidate.numeric_parameter) || candidate.numeric_parameter <= 0.0) {
+                return {false, candidate.id + " has an invalid numeric quantization step", {}};
             }
+            if (has_quantization
+                && std::abs(candidate.numeric_parameter - quantization_step)
+                    > std::max(1.0e-18, std::abs(quantization_step) * 1.0e-12)) {
+                return {false, "one generic DXF materialization cannot mix different whole-drawing quantization steps", {}};
+            }
+            has_quantization = true;
+            quantization_step = candidate.numeric_parameter;
+            quantized_sources.insert(candidate.source_ids.begin(), candidate.source_ids.end());
+            break;
+        case CandidateKind::ReferenceTransform:
+        case CandidateKind::ReferenceResidual:
+        case CandidateKind::Symmetry:
+        case CandidateKind::Grid:
+        case CandidateKind::SequenceGrammar:
+        case CandidateKind::TensorProbe:
+        case CandidateKind::WaveletProbe:
+        case CandidateKind::SpectralProbe:
+            // These representations are real research/search candidates, but a
+            // standards-compliant generic DXF writer cannot encode them into a
+            // smaller final DWG without changing CAD selection semantics. A
+            // native licensed backend may supply such a materializer later.
+            return {false,
+                    "candidate kind " + candidate_kind_name(candidate.kind)
+                        + " is analysis-only for the generic DXF materializer; native backend reconstruction is required",
+                    {}};
         }
     }
 
-    std::ofstream out(output_dxf, std::ios::binary | std::ios::trunc);
-    if (!out) return {false, "unable to create quantized DXF: " + output_dxf.string(), {}};
-
-    const auto& records = source.records();
-    for (std::size_t index = 0; index < records.size(); ++index) {
-        const auto& record = records[index];
-        out << record.raw_code_line << '\n';
-        if (!quantizable_records.contains(index)) {
-            out << record.raw_value_line << '\n';
-            continue;
+    if (!has_quantization) {
+        try {
+            source.write(output_dxf, DxfWriteMode::PreserveLexical);
+        } catch (const std::exception& error) {
+            return {false, error.what(), {}};
         }
-
-        double value = 0.0;
-        if (!parse_double(record.value, value)) {
-            out << record.raw_value_line << '\n';
-            continue;
-        }
-        const double quantized = std::round(value / step_) * step_;
-        out << format_quantized(quantized) << '\n';
+        return {true, "plan-aware raw reconstruction", output_dxf};
     }
-    out.flush();
-    if (!out) return {false, "failed while writing quantized DXF", {}};
-    return {true, name(), output_dxf};
+
+    return write_quantized_dxf(source,
+                               quantized_sources,
+                               quantization_step,
+                               output_dxf,
+                               "plan-aware numeric quantization");
 }
 
 const PlanEvaluation* EvaluationReport::winner() const {
