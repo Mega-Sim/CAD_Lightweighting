@@ -56,6 +56,44 @@ double sweep_deg(const GeometryView& view) {
     return sweep;
 }
 
+std::string canonical_signature_impl(const GeometryView& view,
+                                     double quantization,
+                                     bool normalize_uniform_scale,
+                                     bool mirror_y) {
+    if (!view.supported || !view.complete) {
+        return "unsupported:" + view.type + ':' + view.source_id;
+    }
+    if (view.type == "TEXT") return "text-isolated:" + view.source_id;
+
+    const auto transform = make_canonical_transform(view, normalize_uniform_scale);
+    auto canonical = transform_geometry_view(view, transform.forward);
+    if (mirror_y) {
+        for (auto& point : canonical.points) point.y = -point.y;
+    }
+
+    std::ostringstream out;
+    out << canonical.type << '|';
+    out << std::fixed << std::setprecision(9);
+    out << canonical.points.size() << '|';
+    for (const auto& point : canonical.points) {
+        out << quantize(point.x, quantization) << ','
+            << quantize(point.y, quantization) << ','
+            << quantize(point.z, quantization) << ';';
+    }
+    if (canonical.has_radius) out << "r=" << quantize(canonical.radius, quantization) << '|';
+    if (canonical.has_angles) out << "sweep=" << quantize(sweep_deg(canonical), quantization) << '|';
+    if (canonical.has_text_height) {
+        out << "h=" << quantize(canonical.text_height, quantization) << '|';
+    }
+    return out.str();
+}
+
+std::string reflection_family_signature(const GeometryView& view, double quantization) {
+    const auto ordinary = canonical_signature_impl(view, quantization, false, false);
+    const auto mirrored = canonical_signature_impl(view, quantization, false, true);
+    return std::min(ordinary, mirrored);
+}
+
 double estimate_residual_bytes(const GeometryView& reference,
                                const GeometryView& candidate) {
     if (reference.type != candidate.type || reference.points.size() != candidate.points.size()) {
@@ -87,6 +125,7 @@ CandidateRecipe raw_candidate(const GeometryView& view, std::size_t index) {
     recipe.kind = CandidateKind::Raw;
     recipe.scope = {CandidateScopeKind::Object, view.source_id, {view.source_id}};
     recipe.source_ids = {view.source_id};
+    recipe.transform_chain = {"emit_source"};
     recipe.reconstruction_recipe = "emit_original_source_entity";
     recipe.provenance = "immutable_source_truth";
     recipe.estimated_bytes = estimate_raw_geometry_bytes(view);
@@ -106,6 +145,7 @@ std::string candidate_kind_name(CandidateKind kind) {
     case CandidateKind::Symmetry: return "symmetry";
     case CandidateKind::Grid: return "grid";
     case CandidateKind::SequenceGrammar: return "sequence_grammar";
+    case CandidateKind::PrimitiveReductionProbe: return "primitive_reduction_probe";
     case CandidateKind::TensorProbe: return "tensor_probe";
     case CandidateKind::WaveletProbe: return "wavelet_probe";
     case CandidateKind::SpectralProbe: return "spectral_probe";
@@ -130,31 +170,7 @@ std::string candidate_scope_name(CandidateScopeKind kind) {
 std::string canonical_signature(const GeometryView& view,
                                 double quantization,
                                 bool normalize_uniform_scale) {
-    if (!view.supported || !view.complete) {
-        return "unsupported:" + view.type + ':' + view.source_id;
-    }
-    // TEXT contents are semantic, not only geometric. Until text payload is part of
-    // GeometryView, keep TEXT instances isolated rather than risking false deduplication.
-    if (view.type == "TEXT") return "text-isolated:" + view.source_id;
-
-    const auto transform = make_canonical_transform(view, normalize_uniform_scale);
-    const auto canonical = transform_geometry_view(view, transform.forward);
-
-    std::ostringstream out;
-    out << canonical.type << '|';
-    out << std::fixed << std::setprecision(9);
-    out << canonical.points.size() << '|';
-    for (const auto& point : canonical.points) {
-        out << quantize(point.x, quantization) << ','
-            << quantize(point.y, quantization) << ','
-            << quantize(point.z, quantization) << ';';
-    }
-    if (canonical.has_radius) out << "r=" << quantize(canonical.radius, quantization) << '|';
-    if (canonical.has_angles) out << "sweep=" << quantize(sweep_deg(canonical), quantization) << '|';
-    if (canonical.has_text_height) {
-        out << "h=" << quantize(canonical.text_height, quantization) << '|';
-    }
-    return out.str();
+    return canonical_signature_impl(view, quantization, normalize_uniform_scale, false);
 }
 
 double estimate_raw_geometry_bytes(const GeometryView& view) {
@@ -199,6 +215,7 @@ CandidateSet discover_representation_candidates(
 
     std::map<std::string, std::vector<std::size_t>> exact_groups;
     std::map<std::string, std::vector<std::size_t>> near_groups;
+    std::map<std::string, std::vector<std::size_t>> symmetry_groups;
     double raw_total = 0.0;
 
     for (std::size_t index = 0; index < views.size(); ++index) {
@@ -208,9 +225,28 @@ CandidateSet discover_representation_candidates(
         raw_total += raw.estimated_bytes;
         result.candidates.push_back(std::move(raw));
 
+        if (view.supported && view.complete && view.type == "LWPOLYLINE"
+            && view.points.size() >= 3) {
+            CandidateRecipe primitive;
+            primitive.id = "primitive-probe:" + std::to_string(index) + ':' + view.source_id;
+            primitive.kind = CandidateKind::PrimitiveReductionProbe;
+            primitive.scope = {CandidateScopeKind::Object, view.source_id, {view.source_id}};
+            primitive.source_ids = {view.source_id};
+            primitive.transform_chain = {"canonicalize", "primitive_fit", "capture_residual", "restore_entity_units"};
+            primitive.reconstruction_recipe = "fit_primitive_plus_residual_then_restore_original_polyline_entity";
+            primitive.provenance = "lwpolyline_primitive_fit_probe";
+            primitive.estimated_bytes = std::max(24.0, estimate_raw_geometry_bytes(view) * 0.70);
+            primitive.residual_estimated_bytes = estimate_raw_geometry_bytes(view) * 0.15;
+            primitive.loss_risk = 0.5;
+            primitive.preserves_selection_cardinality = true;
+            result.candidates.push_back(std::move(primitive));
+        }
+
         if (!view.supported || !view.complete || view.type == "TEXT") continue;
-        exact_groups[canonical_signature(view, 1e-9, false)].push_back(index);
+        const auto exact_signature = canonical_signature(view, 1e-9, false);
+        exact_groups[exact_signature].push_back(index);
         near_groups[canonical_signature(view, 1e-3, false)].push_back(index);
+        symmetry_groups[reflection_family_signature(view, 1e-9)].push_back(index);
     }
 
     std::size_t group_number = 0;
@@ -224,6 +260,7 @@ CandidateSet discover_representation_candidates(
         recipe.scope.kind = CandidateScopeKind::Pattern;
         recipe.scope.id = recipe.id;
         recipe.reference_source_id = reference.source_id;
+        recipe.transform_chain = {"canonicalize", "reference_transform", "restore_entity_units"};
         recipe.reconstruction_recipe = "expand_reference_transform_then_restore_original_entity_units";
         recipe.provenance = "exact_transform_invariant_signature:" + signature;
         recipe.loss_risk = 0.0;
@@ -247,6 +284,7 @@ CandidateSet discover_representation_candidates(
             grid.id = "grid:" + std::to_string(group_number++);
             grid.kind = CandidateKind::Grid;
             grid.scope.id = grid.id;
+            grid.transform_chain = {"canonicalize", "grid_fit", "placement_stream", "restore_entity_units"};
             grid.provenance = "repeated_transform_family_grid_probe";
             grid.reconstruction_recipe = "expand_grid_placements_then_restore_original_entity_units";
             grid.estimated_bytes = estimate_raw_geometry_bytes(reference)
@@ -259,6 +297,7 @@ CandidateSet discover_representation_candidates(
             grammar.id = "grammar:" + std::to_string(group_number++);
             grammar.kind = CandidateKind::SequenceGrammar;
             grammar.scope.id = grammar.id;
+            grammar.transform_chain = {"canonicalize", "grammar_encode", "token_stream", "restore_entity_units"};
             grammar.provenance = "repeated_exact_signature_sequence_probe";
             grammar.reconstruction_recipe = "expand_grammar_tokens_then_restore_original_entity_units";
             grammar.estimated_bytes = estimate_raw_geometry_bytes(reference)
@@ -266,6 +305,44 @@ CandidateSet discover_representation_candidates(
                                     + 64.0;
             result.candidates.push_back(std::move(grammar));
         }
+    }
+
+    std::size_t symmetry_number = 0;
+    for (const auto& [signature, indices] : symmetry_groups) {
+        if (indices.size() < 2) continue;
+        std::set<std::string> ordinary_signatures;
+        for (const auto index : indices) {
+            ordinary_signatures.insert(canonical_signature(views[index], 1e-9, false));
+        }
+        // If all ordinary signatures are identical the exact-reference family
+        // already models the relation. Emit Symmetry only when reflection adds
+        // a relationship that ordinary translation/rotation canonicalization did not.
+        if (ordinary_signatures.size() <= 1) continue;
+
+        CandidateRecipe symmetry;
+        symmetry.id = "symmetry:" + std::to_string(symmetry_number++);
+        symmetry.kind = CandidateKind::Symmetry;
+        symmetry.scope.kind = CandidateScopeKind::Pattern;
+        symmetry.scope.id = symmetry.id;
+        symmetry.reference_source_id = views[indices.front()].source_id;
+        symmetry.transform_chain = {"canonicalize", "reflection_symmetry", "placement_stream", "restore_entity_units"};
+        symmetry.reconstruction_recipe = "expand_reflection_symmetry_then_restore_original_entity_units";
+        symmetry.provenance = "reflection_family_signature:" + signature;
+        symmetry.loss_risk = 0.0;
+        symmetry.preserves_selection_cardinality = true;
+        double raw_group = 0.0;
+        for (const auto index : indices) {
+            symmetry.source_ids.push_back(views[index].source_id);
+            symmetry.scope.source_ids.push_back(views[index].source_id);
+            raw_group += estimate_raw_geometry_bytes(views[index]);
+        }
+        symmetry.estimated_bytes = estimate_raw_geometry_bytes(views[indices.front()])
+                                 + static_cast<double>(indices.size()) * 52.0
+                                 + estimate_description_bytes({signature});
+        if (symmetry.estimated_bytes < raw_group) {
+            estimated_structural_savings += raw_group - symmetry.estimated_bytes;
+        }
+        result.candidates.push_back(std::move(symmetry));
     }
 
     std::size_t near_number = 0;
@@ -284,6 +361,7 @@ CandidateSet discover_representation_candidates(
         recipe.scope.kind = CandidateScopeKind::Pattern;
         recipe.scope.id = recipe.id;
         recipe.reference_source_id = reference.source_id;
+        recipe.transform_chain = {"canonicalize", "reference_transform", "residual_encode", "restore_entity_units"};
         recipe.reconstruction_recipe = "decode_reference_plus_residual_then_restore_original_entity_units";
         recipe.provenance = "near_transform_invariant_signature:" + signature;
         recipe.loss_risk = 0.25;
@@ -310,6 +388,7 @@ CandidateSet discover_representation_candidates(
             recipe.kind = CandidateKind::NumericQuantization;
             recipe.scope = {CandidateScopeKind::WholeDrawing, recipe.id, result.source_universe};
             recipe.source_ids = result.source_universe;
+            recipe.transform_chain = {"numeric_quantization"};
             recipe.reconstruction_recipe = "quantize_supported_numeric_geometry_keep_entity_units";
             recipe.provenance = "bounded_numeric_quantization_exact_dwg_probe";
             recipe.estimated_bytes = quantization_estimate(raw_total, step);
@@ -326,6 +405,7 @@ CandidateSet discover_representation_candidates(
         whole.kind = CandidateKind::SequenceGrammar;
         whole.scope = {CandidateScopeKind::WholeDrawing, "whole", result.source_universe};
         whole.source_ids = result.source_universe;
+        whole.transform_chain = {"candidate_partition", "grammar_encode", "raw_fallback", "restore_entity_units"};
         whole.reconstruction_recipe = "compose_discovered_patterns_and_raw_fallback_then_restore_source_units";
         whole.provenance = "whole_drawing_description_length_probe";
         whole.estimated_bytes = std::max(1.0, raw_total - estimated_structural_savings * 0.8);
@@ -357,6 +437,10 @@ CandidateValidation validate_candidate_set(const CandidateSet& set) {
             validation.pass = false;
             validation.issues.push_back(candidate.id + " does not preserve source selection cardinality");
         }
+        if (candidate.transform_chain.empty()) {
+            validation.pass = false;
+            validation.issues.push_back(candidate.id + " has no ordered transform chain");
+        }
         std::unordered_set<std::string> local;
         for (const auto& source_id : candidate.source_ids) {
             if (!universe.contains(source_id)) {
@@ -380,6 +464,18 @@ CandidateValidation validate_candidate_set(const CandidateSet& set) {
             }
         }
     }
+
+    for (const auto& candidate : set.candidates) {
+        for (const auto& conflict : candidate.conflicts) {
+            if (conflict == candidate.id) {
+                validation.pass = false;
+                validation.issues.push_back(candidate.id + " conflicts with itself");
+            } else if (!candidate_ids.contains(conflict)) {
+                validation.pass = false;
+                validation.issues.push_back(candidate.id + " references unknown conflict candidate: " + conflict);
+            }
+        }
+    }
     return validation;
 }
 
@@ -397,6 +493,7 @@ std::string candidate_set_to_json(const CandidateSet& set) {
         out << "{\"id\":\"" << escape_json(candidate.id)
             << "\",\"kind\":\"" << candidate_kind_name(candidate.kind)
             << "\",\"scope\":\"" << candidate_scope_name(candidate.scope.kind)
+            << "\",\"scope_id\":\"" << escape_json(candidate.scope.id)
             << "\",\"estimated_bytes\":" << candidate.estimated_bytes
             << ",\"residual_estimated_bytes\":" << candidate.residual_estimated_bytes
             << ",\"loss_risk\":" << candidate.loss_risk
@@ -408,6 +505,16 @@ std::string candidate_set_to_json(const CandidateSet& set) {
         for (std::size_t j = 0; j < candidate.source_ids.size(); ++j) {
             if (j) out << ',';
             out << '"' << escape_json(candidate.source_ids[j]) << '"';
+        }
+        out << "],\"conflicts\":[";
+        for (std::size_t j = 0; j < candidate.conflicts.size(); ++j) {
+            if (j) out << ',';
+            out << '"' << escape_json(candidate.conflicts[j]) << '"';
+        }
+        out << "],\"transform_chain\":[";
+        for (std::size_t j = 0; j < candidate.transform_chain.size(); ++j) {
+            if (j) out << ',';
+            out << '"' << escape_json(candidate.transform_chain[j]) << '"';
         }
         out << "],\"reconstruction_recipe\":\"" << escape_json(candidate.reconstruction_recipe)
             << "\",\"provenance\":\"" << escape_json(candidate.provenance) << "\"}";
