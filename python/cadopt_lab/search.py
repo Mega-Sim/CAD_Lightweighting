@@ -93,6 +93,73 @@ def _non_raw_indices(candidate_set: dict) -> list[int]:
     return result
 
 
+def _plan_order(plan: SearchPlan) -> tuple[float, tuple[int, ...]]:
+    return plan.estimated_bytes, plan.candidate_indices
+
+
+def bounded_exhaustive_search(
+    candidate_set: dict,
+    *,
+    max_non_raw: int = 20,
+    max_results: int = 128,
+) -> list[SearchPlan]:
+    """Enumerate non-overlapping non-raw subsets when the space is tractable."""
+    available = _non_raw_indices(candidate_set)
+    if len(available) > max_non_raw:
+        return beam_search(candidate_set, beam_width=max(16, max_results), max_results=max_results)
+
+    results: dict[tuple[int, ...], SearchPlan] = {}
+
+    def visit(position: int, selected: tuple[int, ...]) -> None:
+        if position == len(available):
+            plan = complete_with_raw(candidate_set, selected)
+            if plan is not None:
+                results[plan.candidate_indices] = plan
+            return
+        visit(position + 1, selected)
+        index = available[position]
+        proposal = selected + (index,)
+        if complete_with_raw(candidate_set, proposal) is not None:
+            visit(position + 1, proposal)
+
+    visit(0, ())
+    ordered = sorted(results.values(), key=_plan_order)
+    return ordered[: max(1, max_results)]
+
+
+def beam_search(
+    candidate_set: dict,
+    *,
+    beam_width: int = 64,
+    max_results: int = 128,
+) -> list[SearchPlan]:
+    """Keep the lowest proxy-cost valid partial exact-cover states."""
+    available = _non_raw_indices(candidate_set)
+    beam: list[tuple[int, ...]] = [()]
+    width = max(1, beam_width)
+
+    for index in available:
+        proposals: set[tuple[int, ...]] = set(beam)
+        for state in beam:
+            candidate = tuple(sorted(state + (index,)))
+            if complete_with_raw(candidate_set, candidate) is not None:
+                proposals.add(candidate)
+        scored: list[tuple[float, tuple[int, ...]]] = []
+        for state in proposals:
+            plan = complete_with_raw(candidate_set, state)
+            if plan is not None:
+                scored.append((plan.estimated_bytes, state))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        beam = [state for _, state in scored[:width]]
+
+    results: dict[tuple[int, ...], SearchPlan] = {}
+    for state in beam:
+        plan = complete_with_raw(candidate_set, state)
+        if plan is not None:
+            results[plan.candidate_indices] = plan
+    return sorted(results.values(), key=_plan_order)[: max(1, max_results)]
+
+
 def _mutate(candidate_set: dict, state: set[int], rng: random.Random) -> set[int]:
     available = _non_raw_indices(candidate_set)
     if not available:
@@ -128,13 +195,7 @@ def simulated_annealing(
     initial_temperature_fraction: float = 0.05,
     final_temperature_fraction: float = 1.0e-6,
 ) -> SearchPlan:
-    """Search estimated-byte space with a cost-scaled annealing schedule.
-
-    Temperature is expressed as a fraction of the raw exact-cover cost so an
-    uphill move of tens/hundreds of estimated bytes can actually be accepted
-    early in the run. This remains a search heuristic only; final DWG bytes are
-    measured and validated by C++ M6.
-    """
+    """Search estimated-byte space with a cost-scaled annealing schedule."""
     if initial_temperature_fraction <= 0.0 or final_temperature_fraction <= 0.0:
         raise ValueError("temperature fractions must be positive")
 
@@ -157,19 +218,12 @@ def simulated_annealing(
             continue
 
         progress = step / max(1, steps - 1)
-        # Geometric cooling keeps the schedule scale-invariant.
         temperature = start_temperature * ((end_temperature / start_temperature) ** progress)
         delta = proposal.estimated_bytes - current.estimated_bytes
         if delta <= 0.0 or rng.random() < math.exp(-delta / max(temperature, 1.0e-12)):
             state = proposal_state
             current = proposal
-        if (
-            current.estimated_bytes < best.estimated_bytes
-            or (
-                current.estimated_bytes == best.estimated_bytes
-                and current.candidate_indices < best.candidate_indices
-            )
-        ):
+        if _plan_order(current) < _plan_order(best):
             best = current
     return best
 
@@ -197,10 +251,8 @@ def genetic_search(
             if rng.random() < 0.35:
                 proposal = set(state)
                 proposal.add(index)
-                plan = complete_with_raw(candidate_set, proposal)
-                if plan is None:
-                    continue
-                state.add(index)
+                if complete_with_raw(candidate_set, proposal) is not None:
+                    state.add(index)
         return state
 
     population = [random_state() for _ in range(max(2, population_size))]
@@ -212,13 +264,7 @@ def genetic_search(
             if plan is None:
                 continue
             scored.append((plan.estimated_bytes, state, plan))
-            if (
-                plan.estimated_bytes < best.estimated_bytes
-                or (
-                    plan.estimated_bytes == best.estimated_bytes
-                    and plan.candidate_indices < best.candidate_indices
-                )
-            ):
+            if _plan_order(plan) < _plan_order(best):
                 best = plan
         if not scored:
             population = [random_state() for _ in range(max(2, population_size))]
@@ -231,8 +277,6 @@ def genetic_search(
             a = rng.choice(elites)
             b = rng.choice(elites)
             child = set(index for index in a.union(b) if rng.random() < 0.5)
-            # Repair by adding candidates in low estimated-cost-per-source order,
-            # accepting only states that still admit an exact raw fallback.
             ordered = sorted(
                 child,
                 key=lambda idx: (
@@ -248,9 +292,8 @@ def genetic_search(
                 if complete_with_raw(candidate_set, proposal) is not None:
                     repaired = proposal
             if rng.random() < 0.35:
-                repaired = _mutate(candidate_set, repaired, rng)
-                if complete_with_raw(candidate_set, repaired) is None:
-                    repaired = set()
+                mutated = _mutate(candidate_set, repaired, rng)
+                repaired = mutated if complete_with_raw(candidate_set, mutated) is not None else set()
             next_population.append(repaired)
         population = next_population
     return best
