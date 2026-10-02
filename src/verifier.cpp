@@ -250,7 +250,6 @@ std::vector<std::string> resolved_group_members(const DxfDocument& doc, const Dx
 }
 
 std::string object_key(const DxfObject& object, std::size_t ordinal) {
-    if (object.type == "GROUP" && !object.name.empty()) return "GROUP:" + object.name;
     return object.type + ":" + std::to_string(ordinal);
 }
 
