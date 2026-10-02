@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -50,6 +49,25 @@ bool overlaps(const CandidateRecipe& candidate, const std::unordered_set<std::st
     });
 }
 
+bool conflicts_with_selected(const CandidateSet& set,
+                             std::size_t candidate_index,
+                             const std::vector<std::size_t>& selected) {
+    if (candidate_index >= set.candidates.size()) return true;
+    const auto& candidate = set.candidates[candidate_index];
+    const std::unordered_set<std::string> candidate_conflicts(candidate.conflicts.begin(),
+                                                               candidate.conflicts.end());
+    for (const auto index : selected) {
+        if (index >= set.candidates.size()) return true;
+        const auto& existing = set.candidates[index];
+        if (candidate_conflicts.contains(existing.id)) return true;
+        if (std::find(existing.conflicts.begin(), existing.conflicts.end(), candidate.id)
+            != existing.conflicts.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void fill_raw_fallback(const CandidateSet& set,
                        const std::unordered_map<std::string, std::size_t>& raw,
                        std::vector<std::size_t>& selected,
@@ -59,6 +77,17 @@ void fill_raw_fallback(const CandidateSet& set,
         const auto it = raw.find(source);
         if (it != raw.end()) selected.push_back(it->second);
     }
+}
+
+std::vector<std::size_t> all_raw_indices(const CandidateSet& set,
+                                         const std::unordered_map<std::string, std::size_t>& raw) {
+    std::vector<std::size_t> indices;
+    indices.reserve(set.source_universe.size());
+    for (const auto& source : set.source_universe) {
+        const auto it = raw.find(source);
+        if (it != raw.end()) indices.push_back(it->second);
+    }
+    return indices;
 }
 
 std::string key_for_indices(std::vector<std::size_t> indices) {
@@ -178,12 +207,17 @@ CandidatePlan greedy_search(const CandidateSet& set) {
     std::unordered_set<std::string> covered;
     for (const auto& item : ranked) {
         const auto& candidate = set.candidates[item.index];
-        if (overlaps(candidate, covered)) continue;
+        if (overlaps(candidate, covered) || conflicts_with_selected(set, item.index, selected)) continue;
         selected.push_back(item.index);
         covered.insert(candidate.source_ids.begin(), candidate.source_ids.end());
     }
     fill_raw_fallback(set, raw, selected, covered);
-    return build_plan(set, std::move(selected), "greedy");
+    auto plan = build_plan(set, std::move(selected), "greedy");
+    if (plan.structurally_valid) return plan;
+
+    auto raw_plan = build_plan(set, all_raw_indices(set, raw), "greedy:raw-fallback");
+    raw_plan.issues.insert(raw_plan.issues.end(), plan.issues.begin(), plan.issues.end());
+    return raw_plan;
 }
 
 std::vector<CandidatePlan> exhaustive_search(const CandidateSet& set,
@@ -227,7 +261,7 @@ std::vector<CandidatePlan> exhaustive_search(const CandidateSet& set,
 
         const auto index = non_raw[pos];
         const auto& candidate = set.candidates[index];
-        if (overlaps(candidate, covered)) return;
+        if (overlaps(candidate, covered) || conflicts_with_selected(set, index, selected)) return;
         selected.push_back(index);
         for (const auto& source : candidate.source_ids) covered.insert(source);
         visit(pos + 1);
@@ -270,7 +304,8 @@ std::vector<CandidatePlan> beam_search(const CandidateSet& set,
         next.reserve(beam.size() * 2);
         for (const auto& state : beam) {
             next.push_back(state);
-            if (!overlaps(set.candidates[index], state.covered)) {
+            if (!overlaps(set.candidates[index], state.covered)
+                && !conflicts_with_selected(set, index, state.selected)) {
                 auto take = state;
                 take.selected.push_back(index);
                 take.covered.insert(set.candidates[index].source_ids.begin(),
