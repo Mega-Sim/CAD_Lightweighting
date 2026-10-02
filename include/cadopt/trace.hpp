@@ -50,6 +50,7 @@ public:
                                 std::string detail,
                                 std::string metric_name = {},
                                 double metric_value = 0.0);
+    bool has_fatal_issue() const noexcept;
     std::string to_json() const;
 
 private:
