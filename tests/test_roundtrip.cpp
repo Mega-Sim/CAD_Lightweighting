@@ -27,6 +27,33 @@ static void test_lexical_roundtrip_is_byte_exact() {
     fs::remove(out);
 }
 
+static void test_crlf_source_truth_roundtrip_is_byte_exact() {
+    const fs::path input = fs::temp_directory_path() / "cadopt_roundtrip_crlf_input.dxf";
+    const fs::path out = fs::temp_directory_path() / "cadopt_roundtrip_crlf_output.dxf";
+    const std::string bytes =
+        "0\r\nSECTION\r\n"
+        "2\r\nENTITIES\r\n"
+        "0\r\nLINE\r\n"
+        "5\r\nA\r\n"
+        "8\r\n0\r\n"
+        "10\r\n0.125000\r\n"
+        "20\r\n0.0\r\n"
+        "11\r\n1.125000\r\n"
+        "21\r\n1.0\r\n"
+        "0\r\nENDSEC\r\n"
+        "0\r\nEOF";
+    {
+        std::ofstream file(input, std::ios::binary | std::ios::trunc);
+        file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    auto doc = cadopt::DxfDocument::read(input);
+    doc.write(out, cadopt::DxfWriteMode::PreserveLexical);
+    require(read_all(input) == read_all(out),
+            "PreserveLexical must retain CRLF and the original final-newline state byte-for-byte");
+    fs::remove(input);
+    fs::remove(out);
+}
+
 static void test_entity_index_preserves_selection_units() {
     const fs::path input = fs::path(CADOPT_TEST_FIXTURE_DIR) / "minimal.dxf";
     auto doc = cadopt::DxfDocument::read(input);
@@ -60,6 +87,7 @@ static void test_trace_reports_transform_chain() {
 int main() {
     try {
         test_lexical_roundtrip_is_byte_exact();
+        test_crlf_source_truth_roundtrip_is_byte_exact();
         test_entity_index_preserves_selection_units();
         test_verifier_detects_semantic_loss();
         test_trace_reports_transform_chain();
