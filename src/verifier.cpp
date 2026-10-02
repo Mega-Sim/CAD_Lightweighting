@@ -4,9 +4,11 @@
 #include <cstdlib>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace cadopt {
 namespace {
@@ -216,6 +218,74 @@ void add_issue(VerificationReport& report,
     report.issues.push_back(std::move(issue));
 }
 
+std::string entity_semantic_span(const DxfDocument& doc, const DxfEntity& entity) {
+    return canonical_span(doc,
+                          entity.first_record,
+                          entity.last_record_exclusive,
+                          entity.type,
+                          geometry_supported(entity.type),
+                          false,
+                          false);
+}
+
+std::string entity_xdata_span(const DxfDocument& doc, const DxfEntity& entity) {
+    return canonical_span(doc,
+                          entity.first_record,
+                          entity.last_record_exclusive,
+                          entity.type,
+                          false,
+                          true,
+                          false);
+}
+
+std::string entity_bucket_key(const DxfDocument& doc, const DxfEntity& entity) {
+    std::ostringstream out;
+    out << entity.type << '\x1f'
+        << entity.layer << '\x1f'
+        << entity.block_name << '\x1f'
+        << entity_semantic_span(doc, entity) << '\x1f'
+        << entity_xdata_span(doc, entity);
+    return out.str();
+}
+
+bool entities_fully_equivalent(const DxfDocument& source,
+                               const DxfEntity& source_entity,
+                               const DxfDocument& candidate,
+                               const DxfEntity& candidate_entity,
+                               const VerificationOptions& options) {
+    if (source_entity.type != candidate_entity.type
+        || source_entity.layer != candidate_entity.layer
+        || source_entity.block_name != candidate_entity.block_name
+        || entity_semantic_span(source, source_entity) != entity_semantic_span(candidate, candidate_entity)
+        || entity_xdata_span(source, source_entity) != entity_xdata_span(candidate, candidate_entity)) {
+        return false;
+    }
+    double max_delta = 0.0;
+    std::string detail;
+    return geometry_equivalent(source, source_entity, candidate, candidate_entity,
+                               options, max_delta, detail);
+}
+
+int diagnostic_match_score(const DxfDocument& source,
+                           const DxfEntity& source_entity,
+                           const DxfDocument& candidate,
+                           const DxfEntity& candidate_entity,
+                           const VerificationOptions& options) {
+    if (source_entity.type != candidate_entity.type) return -1;
+    int score = 0;
+    if (source_entity.layer == candidate_entity.layer) score += 8;
+    if (source_entity.block_name == candidate_entity.block_name) score += 8;
+    if (entity_semantic_span(source, source_entity) == entity_semantic_span(candidate, candidate_entity)) score += 16;
+    if (entity_xdata_span(source, source_entity) == entity_xdata_span(candidate, candidate_entity)) score += 8;
+    double max_delta = 0.0;
+    std::string detail;
+    if (geometry_equivalent(source, source_entity, candidate, candidate_entity,
+                            options, max_delta, detail)) {
+        score += 32;
+    }
+    return score;
+}
+
 std::string entity_selection_signature(const DxfDocument& doc, const DxfEntity& entity) {
     std::ostringstream out;
     out << entity.type << '|' << entity.layer << '|';
@@ -275,16 +345,69 @@ VerificationReport verify_semantic_equivalence(const DxfDocument& source,
         ++report.interaction_mismatches;
     }
 
-    const auto n = std::min(source.entities().size(), candidate.entities().size());
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto& s = source.entities()[i];
-        const auto& c = candidate.entities()[i];
-        if (s.type != c.type) {
+    const auto& source_entities = source.entities();
+    const auto& candidate_entities = candidate.entities();
+    std::vector<std::optional<std::size_t>> matches(source_entities.size());
+    std::vector<bool> candidate_used(candidate_entities.size(), false);
+
+    std::unordered_map<std::string, std::vector<std::size_t>> candidate_buckets;
+    candidate_buckets.reserve(candidate_entities.size());
+    for (std::size_t i = 0; i < candidate_entities.size(); ++i) {
+        candidate_buckets[entity_bucket_key(candidate, candidate_entities[i])].push_back(i);
+    }
+
+    // First pass: consume entities that are fully equivalent. This makes DWG
+    // reader/writer reordering irrelevant without weakening any semantic gate.
+    for (std::size_t source_index = 0; source_index < source_entities.size(); ++source_index) {
+        const auto& s = source_entities[source_index];
+        const auto bucket_it = candidate_buckets.find(entity_bucket_key(source, s));
+        if (bucket_it == candidate_buckets.end()) continue;
+        for (const auto candidate_index : bucket_it->second) {
+            if (candidate_used[candidate_index]) continue;
+            if (!entities_fully_equivalent(source, s, candidate, candidate_entities[candidate_index], options)) {
+                continue;
+            }
+            matches[source_index] = candidate_index;
+            candidate_used[candidate_index] = true;
+            break;
+        }
+    }
+
+    // Second pass: only changed/unmatched entities remain. Match within the same
+    // entity type for detailed diagnostics; never reuse a candidate selection unit.
+    for (std::size_t source_index = 0; source_index < source_entities.size(); ++source_index) {
+        if (matches[source_index]) continue;
+        const auto& s = source_entities[source_index];
+        int best_score = -1;
+        std::optional<std::size_t> best_candidate;
+        for (std::size_t candidate_index = 0; candidate_index < candidate_entities.size(); ++candidate_index) {
+            if (candidate_used[candidate_index]) continue;
+            const int score = diagnostic_match_score(source, s, candidate,
+                                                     candidate_entities[candidate_index], options);
+            if (score > best_score) {
+                best_score = score;
+                best_candidate = candidate_index;
+            }
+        }
+        if (best_candidate) {
+            matches[source_index] = *best_candidate;
+            candidate_used[*best_candidate] = true;
+        }
+    }
+
+    for (std::size_t source_index = 0; source_index < source_entities.size(); ++source_index) {
+        const auto& s = source_entities[source_index];
+        if (!matches[source_index]) {
             ++report.entity_type_mismatches;
             ++report.interaction_mismatches;
-            add_issue(report, s.source_id, "interaction.entity_type", s.type + " -> " + c.type);
+            add_issue(report,
+                      s.source_id,
+                      "interaction.entity_type",
+                      "no unmatched candidate entity of type " + s.type + " remains");
             continue;
         }
+        const auto& c = candidate_entities[*matches[source_index]];
+
         if (s.layer != c.layer) {
             ++report.layer_mismatches;
             add_issue(report, s.source_id, "semantic.layer", s.layer + " -> " + c.layer);
@@ -310,20 +433,8 @@ VerificationReport verify_semantic_equivalence(const DxfDocument& source,
                       max_delta);
         }
 
-        const auto source_semantics = canonical_span(source,
-                                                     s.first_record,
-                                                     s.last_record_exclusive,
-                                                     s.type,
-                                                     geometry_supported(s.type),
-                                                     false,
-                                                     false);
-        const auto candidate_semantics = canonical_span(candidate,
-                                                        c.first_record,
-                                                        c.last_record_exclusive,
-                                                        c.type,
-                                                        geometry_supported(c.type),
-                                                        false,
-                                                        false);
+        const auto source_semantics = entity_semantic_span(source, s);
+        const auto candidate_semantics = entity_semantic_span(candidate, c);
         if (source_semantics != candidate_semantics) {
             ++report.semantic_record_mismatches;
             add_issue(report,
@@ -332,20 +443,8 @@ VerificationReport verify_semantic_equivalence(const DxfDocument& source,
                       "non-geometry group-code/value content changed");
         }
 
-        const auto source_xdata = canonical_span(source,
-                                                 s.first_record,
-                                                 s.last_record_exclusive,
-                                                 s.type,
-                                                 false,
-                                                 true,
-                                                 false);
-        const auto candidate_xdata = canonical_span(candidate,
-                                                    c.first_record,
-                                                    c.last_record_exclusive,
-                                                    c.type,
-                                                    false,
-                                                    true,
-                                                    false);
+        const auto source_xdata = entity_xdata_span(source, s);
+        const auto candidate_xdata = entity_xdata_span(candidate, c);
         if (source_xdata != candidate_xdata) {
             ++report.xdata_mismatches;
             add_issue(report, s.source_id, "semantic.xdata", "XDATA content changed");
