@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace cadopt {
@@ -64,6 +65,38 @@ private:
     static ConversionResult run_template(const std::string& command_template,
                                          const std::filesystem::path& input,
                                          const std::filesystem::path& output);
+};
+
+// Runtime ABI for separately licensed native DWG hosts.
+// The shared library must export:
+//   int cadopt_backend_api_version(void)                     -> must return 1
+//   const char* cadopt_backend_name(void)                    -> optional
+//   int cadopt_backend_dxf_to_dwg(const char*, const char*, char*, size_t)
+//   int cadopt_backend_dwg_to_dxf(const char*, const char*, char*, size_t)
+// Paths are UTF-8. Conversion functions return 0 on success and may write a
+// UTF-8 diagnostic into the supplied message buffer.
+class NativeLibraryDwgBackend final : public DwgBackend {
+public:
+    NativeLibraryDwgBackend(std::filesystem::path library_path,
+                            DwgBackendProfile profile);
+    ~NativeLibraryDwgBackend() override;
+
+    NativeLibraryDwgBackend(const NativeLibraryDwgBackend&) = delete;
+    NativeLibraryDwgBackend& operator=(const NativeLibraryDwgBackend&) = delete;
+    NativeLibraryDwgBackend(NativeLibraryDwgBackend&&) noexcept;
+    NativeLibraryDwgBackend& operator=(NativeLibraryDwgBackend&&) noexcept;
+
+    DwgBackendCapabilities capabilities() const override;
+    ConversionResult dxf_to_dwg(const std::filesystem::path& input,
+                                const std::filesystem::path& output) const override;
+    ConversionResult dwg_to_dxf(const std::filesystem::path& input,
+                                const std::filesystem::path& output) const override;
+
+    const std::filesystem::path& library_path() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace cadopt
