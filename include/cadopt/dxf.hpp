@@ -21,6 +21,28 @@ struct DxfEntity {
     std::string type;
     std::string handle;
     std::string layer;
+    std::string block_name;
+    std::vector<std::string> xdata_apps;
+    std::size_t first_record{};
+    std::size_t last_record_exclusive{};
+};
+
+struct DxfBlockDefinition {
+    std::string source_id;
+    std::string name;
+    std::string handle;
+    std::size_t first_record{};
+    std::size_t last_record_exclusive{};
+};
+
+struct DxfObject {
+    std::string source_id;
+    std::string type;
+    std::string name;
+    std::string handle;
+    std::string owner_handle;
+    std::vector<std::string> referenced_handles;
+    std::vector<std::string> xdata_apps;
     std::size_t first_record{};
     std::size_t last_record_exclusive{};
 };
@@ -32,6 +54,8 @@ public:
 
     const std::vector<DxfRecord>& records() const noexcept { return records_; }
     const std::vector<DxfEntity>& entities() const noexcept { return entities_; }
+    const std::vector<DxfBlockDefinition>& blocks() const noexcept { return blocks_; }
+    const std::vector<DxfObject>& objects() const noexcept { return objects_; }
     std::vector<DxfEntity>& mutable_entities_for_test() noexcept { return entities_; }
 
     std::string semantic_fingerprint(const DxfEntity& entity) const;
@@ -39,7 +63,9 @@ public:
 private:
     std::vector<DxfRecord> records_;
     std::vector<DxfEntity> entities_;
-    void rebuild_entity_index();
+    std::vector<DxfBlockDefinition> blocks_;
+    std::vector<DxfObject> objects_;
+    void rebuild_semantic_indexes();
 };
 
 } // namespace cadopt
