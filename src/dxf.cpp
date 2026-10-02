@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -42,11 +43,15 @@ DxfDocument DxfDocument::read(const std::filesystem::path& path) {
     if (!in) throw std::runtime_error("Unable to open DXF: " + path.string());
 
     DxfDocument doc;
+    doc.original_bytes_ = std::string(std::istreambuf_iterator<char>(in),
+                                      std::istreambuf_iterator<char>());
+    std::istringstream source(doc.original_bytes_);
+
     std::string code_line;
     std::string value_line;
     std::size_t line_no = 1;
-    while (std::getline(in, code_line)) {
-        if (!std::getline(in, value_line)) {
+    while (std::getline(source, code_line)) {
+        if (!std::getline(source, value_line)) {
             throw std::runtime_error("Malformed DXF: dangling group-code line at " + std::to_string(line_no));
         }
         if (!code_line.empty() && code_line.back() == '\r') code_line.pop_back();
@@ -73,9 +78,8 @@ void DxfDocument::write(const std::filesystem::path& path, DxfWriteMode mode) co
     }
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("Unable to write DXF: " + path.string());
-    for (const auto& record : records_) {
-        out << record.raw_code_line << '\n' << record.raw_value_line << '\n';
-    }
+    out.write(original_bytes_.data(), static_cast<std::streamsize>(original_bytes_.size()));
+    if (!out) throw std::runtime_error("Unable to finish writing DXF: " + path.string());
 }
 
 void DxfDocument::rebuild_semantic_indexes() {
