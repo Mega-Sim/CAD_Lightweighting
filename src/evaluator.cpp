@@ -73,17 +73,13 @@ bool quantizable_geometry_code(const std::string& type, int code) {
             || code == 11 || code == 21 || code == 31;
     }
     if (type == "ARC" || type == "CIRCLE") {
-        // Start/end angles remain exact in the first lossy path.
         return code == 10 || code == 20 || code == 30 || code == 40;
     }
     if (type == "LWPOLYLINE") {
-        // Keep bulge (42) and angular/dimensionless fields exact.
         return code == 10 || code == 20 || code == 38 || code == 39
             || code == 40 || code == 41 || code == 43;
     }
     if (type == "TEXT") {
-        // Keep rotation/oblique/width-factor values exact. Quantize only
-        // coordinates and text height.
         return code == 10 || code == 20 || code == 30
             || code == 11 || code == 21 || code == 31 || code == 40;
     }
@@ -91,7 +87,7 @@ bool quantizable_geometry_code(const std::string& type, int code) {
 }
 
 std::string format_quantized(double value) {
-    if (value == 0.0) value = 0.0; // canonicalize negative zero
+    if (value == 0.0) value = 0.0;
     std::ostringstream out;
     out << std::setprecision(17) << std::defaultfloat << value;
     return out.str();
@@ -259,13 +255,10 @@ MaterializationResult PlanAwareMaterializer::materialize(
         case CandidateKind::Symmetry:
         case CandidateKind::Grid:
         case CandidateKind::SequenceGrammar:
+        case CandidateKind::PrimitiveReductionProbe:
         case CandidateKind::TensorProbe:
         case CandidateKind::WaveletProbe:
         case CandidateKind::SpectralProbe:
-            // These representations are real research/search candidates, but a
-            // standards-compliant generic DXF writer cannot encode them into a
-            // smaller final DWG without changing CAD selection semantics. A
-            // native licensed backend may supply such a materializer later.
             return {false,
                     "candidate kind " + candidate_kind_name(candidate.kind)
                         + " is analysis-only for the generic DXF materializer; native backend reconstruction is required",
@@ -374,6 +367,17 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
         return report;
     }
 
+    if (trace && trace->has_fatal_issue()) {
+        PlanEvaluation failure;
+        failure.plan_id = "document";
+        failure.materializer = materializer.name();
+        failure.failure_stage = "fatal_trace";
+        failure.failure_reason = "unresolved fatal trace issue exists before exact evaluation";
+        failure.verification.pass = false;
+        report.evaluations.push_back(std::move(failure));
+        return report;
+    }
+
     const std::size_t limit = options.max_plans == 0
         ? plans.size()
         : std::min(options.max_plans, plans.size());
@@ -440,6 +444,12 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
         if (!evaluation.verification.pass) {
             mark_failure(evaluation, plan, "verification",
                          "geometry/semantic/interaction round trip failed");
+            report.evaluations.push_back(std::move(evaluation));
+            continue;
+        }
+        if (trace && trace->has_fatal_issue()) {
+            mark_failure(evaluation, plan, "fatal_trace",
+                         "unresolved fatal trace issue exists after verification");
             report.evaluations.push_back(std::move(evaluation));
             continue;
         }
