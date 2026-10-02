@@ -11,6 +11,7 @@ add_library(cadopt_core
   src/verifier.cpp
   src/trace.cpp
   src/dwg_backend.cpp
+  src/input.cpp
   src/geometry.cpp
   src/candidate.cpp
   src/search.cpp
@@ -49,6 +50,10 @@ if(CADOPT_BUILD_TESTS)
   add_executable(cadopt_search_tests tests/test_search.cpp)
   target_link_libraries(cadopt_search_tests PRIVATE cadopt_core)
   add_test(NAME cadopt_search_tests COMMAND cadopt_search_tests)
+
+  add_executable(cadopt_input_tests tests/test_input.cpp)
+  target_link_libraries(cadopt_input_tests PRIVATE cadopt_core)
+  add_test(NAME cadopt_input_tests COMMAND cadopt_input_tests)
 
   add_library(cadopt_fake_native_backend SHARED tests/fake_native_backend.cpp)
   target_include_directories(cadopt_fake_native_backend PRIVATE include)
