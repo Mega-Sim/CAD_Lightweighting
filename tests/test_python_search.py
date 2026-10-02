@@ -8,7 +8,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 
 from cadopt_lab.qubo import build_exact_cover_qubo
-from cadopt_lab.search import complete_with_raw, genetic_search, simulated_annealing
+from cadopt_lab.search import (
+    beam_search,
+    bounded_exhaustive_search,
+    complete_with_raw,
+    genetic_search,
+    simulated_annealing,
+)
 
 
 def candidate_set() -> dict:
@@ -56,6 +62,19 @@ class SearchTests(unittest.TestCase):
         data = candidate_set()
         plan = complete_with_raw(data, [3])
         self.assertIsNone(plan)
+
+    def test_bounded_exhaustive_finds_lowest_proxy_exact_cover(self) -> None:
+        plans = bounded_exhaustive_search(candidate_set(), max_non_raw=8, max_results=8)
+        self.assertTrue(plans)
+        self.assertEqual(plans[0].estimated_bytes, 40.0)
+        self.assertEqual(plans[0].candidate_indices, (2,))
+
+    def test_beam_search_keeps_valid_exact_covers(self) -> None:
+        plans = beam_search(candidate_set(), beam_width=4, max_results=4)
+        self.assertTrue(plans)
+        self.assertEqual(plans[0].estimated_bytes, 40.0)
+        for plan in plans:
+            self.assertIsNotNone(complete_with_raw(candidate_set(), plan.candidate_indices))
 
     def test_simulated_annealing_is_deterministic_and_finds_compact_exact_cover(self) -> None:
         data = candidate_set()
