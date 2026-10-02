@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -62,7 +63,7 @@ DxfDocument DxfDocument::read(const std::filesystem::path& path) {
         doc.records_.push_back(DxfRecord{code, value_line, code_line, value_line, line_no});
         line_no += 2;
     }
-    doc.rebuild_entity_index();
+    doc.rebuild_semantic_indexes();
     return doc;
 }
 
@@ -77,48 +78,119 @@ void DxfDocument::write(const std::filesystem::path& path, DxfWriteMode mode) co
     }
 }
 
-void DxfDocument::rebuild_entity_index() {
+void DxfDocument::rebuild_semantic_indexes() {
     entities_.clear();
-    bool in_entities = false;
+    blocks_.clear();
+    objects_.clear();
+
+    std::string section;
     std::size_t i = 0;
     while (i < records_.size()) {
         const auto& r = records_[i];
-        if (r.code == 0 && trim(r.value) == "SECTION" && i + 1 < records_.size()
-            && records_[i + 1].code == 2 && trim(records_[i + 1].value) == "ENTITIES") {
-            in_entities = true;
+        const auto value = trim(r.value);
+
+        if (r.code == 0 && value == "SECTION" && i + 1 < records_.size()
+            && records_[i + 1].code == 2) {
+            section = trim(records_[i + 1].value);
             i += 2;
             continue;
         }
-        if (in_entities && r.code == 0 && trim(r.value) == "ENDSEC") {
-            in_entities = false;
-            ++i;
-            continue;
-        }
-        if (!in_entities || r.code != 0) {
+        if (r.code == 0 && value == "ENDSEC") {
+            section.clear();
             ++i;
             continue;
         }
 
-        const std::string type = trim(r.value);
-        if (type == "EOF" || type == "ENDSEC") {
-            ++i;
+        if (section == "ENTITIES" && r.code == 0) {
+            const std::string type = value;
+            if (type == "EOF" || type == "ENDSEC") {
+                ++i;
+                continue;
+            }
+            const std::size_t first = i;
+            std::size_t last = i + 1;
+            while (last < records_.size() && records_[last].code != 0) ++last;
+
+            DxfEntity entity;
+            entity.type = type;
+            entity.first_record = first;
+            entity.last_record_exclusive = last;
+            for (std::size_t j = first + 1; j < last; ++j) {
+                const auto rec_value = trim(records_[j].value);
+                if (records_[j].code == 5 && entity.handle.empty()) entity.handle = rec_value;
+                if (records_[j].code == 8 && entity.layer.empty()) entity.layer = rec_value;
+                if (type == "INSERT" && records_[j].code == 2 && entity.block_name.empty()) {
+                    entity.block_name = rec_value;
+                }
+                if (records_[j].code == 1001) entity.xdata_apps.push_back(rec_value);
+            }
+            entity.source_id = "E:" + (entity.handle.empty() ? std::to_string(first) : entity.handle)
+                             + ":" + std::to_string(first);
+            entities_.push_back(std::move(entity));
+            i = last;
             continue;
         }
-        const std::size_t first = i;
-        std::size_t last = i + 1;
-        while (last < records_.size() && records_[last].code != 0) ++last;
 
-        DxfEntity entity;
-        entity.type = type;
-        entity.first_record = first;
-        entity.last_record_exclusive = last;
-        for (std::size_t j = first + 1; j < last; ++j) {
-            if (records_[j].code == 5 && entity.handle.empty()) entity.handle = trim(records_[j].value);
-            if (records_[j].code == 8 && entity.layer.empty()) entity.layer = trim(records_[j].value);
+        if (section == "BLOCKS" && r.code == 0 && value == "BLOCK") {
+            const std::size_t first = i;
+            std::size_t header_end = i + 1;
+            while (header_end < records_.size() && records_[header_end].code != 0) ++header_end;
+
+            std::size_t endblk = header_end;
+            while (endblk < records_.size()) {
+                if (records_[endblk].code == 0 && trim(records_[endblk].value) == "ENDBLK") break;
+                ++endblk;
+            }
+            std::size_t last = endblk < records_.size() ? endblk + 1 : records_.size();
+            while (last < records_.size() && records_[last].code != 0) ++last;
+
+            DxfBlockDefinition block;
+            block.first_record = first;
+            block.last_record_exclusive = last;
+            for (std::size_t j = first + 1; j < header_end; ++j) {
+                const auto rec_value = trim(records_[j].value);
+                if (records_[j].code == 2 && block.name.empty()) block.name = rec_value;
+                if (records_[j].code == 5 && block.handle.empty()) block.handle = rec_value;
+            }
+            const auto identity = !block.handle.empty() ? block.handle
+                                : (!block.name.empty() ? block.name : std::to_string(first));
+            block.source_id = "B:" + identity + ":" + std::to_string(first);
+            blocks_.push_back(std::move(block));
+            i = last;
+            continue;
         }
-        entity.source_id = "E:" + (entity.handle.empty() ? std::to_string(first) : entity.handle) + ":" + std::to_string(first);
-        entities_.push_back(std::move(entity));
-        i = last;
+
+        if (section == "OBJECTS" && r.code == 0) {
+            const std::string type = value;
+            if (type == "EOF" || type == "ENDSEC") {
+                ++i;
+                continue;
+            }
+            const std::size_t first = i;
+            std::size_t last = i + 1;
+            while (last < records_.size() && records_[last].code != 0) ++last;
+
+            DxfObject object;
+            object.type = type;
+            object.first_record = first;
+            object.last_record_exclusive = last;
+            for (std::size_t j = first + 1; j < last; ++j) {
+                const auto rec_value = trim(records_[j].value);
+                if (records_[j].code == 5 && object.handle.empty()) object.handle = rec_value;
+                if (records_[j].code == 330 && object.owner_handle.empty()) object.owner_handle = rec_value;
+                if (type == "GROUP" && records_[j].code == 300 && object.name.empty()) object.name = rec_value;
+                if (type == "GROUP" && records_[j].code == 340) object.referenced_handles.push_back(rec_value);
+                if (records_[j].code == 1001) object.xdata_apps.push_back(rec_value);
+            }
+            const auto identity = !object.handle.empty() ? object.handle
+                                : (!object.name.empty() ? object.name : type + ":" + std::to_string(first));
+            object.source_id = "O:" + identity + ":" + std::to_string(first);
+            objects_.push_back(std::move(object));
+            i = last;
+            continue;
+        }
+
+        ++i;
     }
 }
 
