@@ -41,6 +41,21 @@ public:
                                       const std::filesystem::path& output_dxf) const override;
 };
 
+class NumericQuantizationMaterializer final : public CandidateMaterializer {
+public:
+    explicit NumericQuantizationMaterializer(double step);
+
+    std::string name() const override;
+    double step() const noexcept { return step_; }
+    MaterializationResult materialize(const DxfDocument& source,
+                                      const CandidateSet& candidate_set,
+                                      const CandidatePlan& plan,
+                                      const std::filesystem::path& output_dxf) const override;
+
+private:
+    double step_{};
+};
+
 struct EvaluationOptions {
     std::filesystem::path work_directory;
     std::size_t max_plans{16};
@@ -80,6 +95,11 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
                                           const CandidateMaterializer& materializer,
                                           const EvaluationOptions& options,
                                           TraceLedger* trace = nullptr);
+
+void recompute_winner(EvaluationReport& report);
+bool append_evaluation_report(EvaluationReport& destination,
+                              EvaluationReport source,
+                              std::string* error = nullptr);
 
 bool copy_winner_dwg(const EvaluationReport& report,
                      const std::filesystem::path& output,
