@@ -1,6 +1,7 @@
 #include <cadopt/dxf.hpp>
 #include <cadopt/verifier.hpp>
 #include <cadopt/trace.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -74,6 +75,17 @@ static void test_verifier_detects_semantic_loss() {
     require(report.entity_type_mismatches == 1, "expected one entity type mismatch");
 }
 
+static void test_verifier_does_not_depend_on_entity_index_order() {
+    const fs::path input = fs::path(CADOPT_TEST_FIXTURE_DIR) / "minimal.dxf";
+    const auto source = cadopt::DxfDocument::read(input);
+    auto candidate = source;
+    auto& entities = candidate.mutable_entities_for_test();
+    std::swap(entities[0], entities[1]);
+    const auto report = cadopt::verify_semantic_equivalence(source, candidate);
+    require(report.pass,
+            "equivalent entity sets must not fail solely because a DWG round-trip reordered entities");
+}
+
 static void test_trace_reports_transform_chain() {
     cadopt::TraceLedger ledger;
     auto id = ledger.begin_entity("source-42", "LINE");
@@ -90,6 +102,7 @@ int main() {
         test_crlf_source_truth_roundtrip_is_byte_exact();
         test_entity_index_preserves_selection_units();
         test_verifier_detects_semantic_loss();
+        test_verifier_does_not_depend_on_entity_index_order();
         test_trace_reports_transform_chain();
         std::cout << "cadopt_tests: PASS\n";
         return 0;
