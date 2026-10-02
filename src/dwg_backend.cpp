@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include <system_error>
 
 namespace cadopt {
@@ -130,7 +131,10 @@ ConversionResult ExternalCommandDwgBackend::run_template(const std::string& comm
         if (error) return {false, -1, "cannot create converter output directory: " + error.message(), 0};
     }
     error.clear();
-    std::filesystem::remove(output, error); // remove stale output; failure is harmless when file did not exist
+    if (std::filesystem::exists(output, error) && !error) {
+        std::filesystem::remove(output, error);
+        if (error) return {false, -1, "cannot remove stale converter output: " + error.message(), 0};
+    }
 
     std::string command = command_template;
     replace_all(command, "{input}", shell_quote(input));
