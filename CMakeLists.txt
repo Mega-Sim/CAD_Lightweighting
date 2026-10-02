@@ -70,6 +70,14 @@ if(CADOPT_BUILD_TESTS)
     CADOPT_TEST_NATIVE_BACKEND_PATH="$<TARGET_FILE:cadopt_fake_native_backend>"
   )
   add_test(NAME cadopt_evaluator_tests COMMAND cadopt_evaluator_tests)
+
+  add_executable(cadopt_native_backend_tests tests/test_native_backend.cpp)
+  target_link_libraries(cadopt_native_backend_tests PRIVATE cadopt_core)
+  add_dependencies(cadopt_native_backend_tests cadopt_fake_native_backend)
+  target_compile_definitions(cadopt_native_backend_tests PRIVATE
+    CADOPT_TEST_NATIVE_BACKEND_PATH="$<TARGET_FILE:cadopt_fake_native_backend>"
+  )
+  add_test(NAME cadopt_native_backend_tests COMMAND cadopt_native_backend_tests)
 endif()
 
 if(CADOPT_BUILD_GUI)
