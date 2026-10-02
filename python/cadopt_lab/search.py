@@ -56,9 +56,19 @@ def _declared_conflict(candidate_set: dict, indices: Sequence[int]) -> bool:
     return False
 
 
+def _partial_valid(candidate_set: dict, indices: Iterable[int]) -> bool:
+    selected = sorted(set(indices))
+    candidates = candidate_set.get("candidates", [])
+    if any(index < 0 or index >= len(candidates) for index in selected):
+        return False
+    if any(candidates[index].get("preserves_selection_cardinality", True) is False for index in selected):
+        return False
+    return not _has_overlap(candidate_set, selected) and not _declared_conflict(candidate_set, selected)
+
+
 def complete_with_raw(candidate_set: dict, non_raw_indices: Iterable[int]) -> SearchPlan | None:
     selected = sorted(set(non_raw_indices))
-    if _has_overlap(candidate_set, selected) or _declared_conflict(candidate_set, selected):
+    if not _partial_valid(candidate_set, selected):
         return None
     universe = list(candidate_set.get("source_universe", []))
     raw = _raw_by_source(candidate_set)
@@ -74,7 +84,7 @@ def complete_with_raw(candidate_set: dict, non_raw_indices: Iterable[int]) -> Se
     if covered != set(universe):
         return None
     selected = sorted(set(selected))
-    if _declared_conflict(candidate_set, selected):
+    if not _partial_valid(candidate_set, selected):
         return None
     cost = sum(float(candidate_set["candidates"][i].get("estimated_bytes", 0.0)) for i in selected)
     return SearchPlan(tuple(selected), cost)
@@ -97,13 +107,31 @@ def _plan_order(plan: SearchPlan) -> tuple[float, tuple[int, ...]]:
     return plan.estimated_bytes, plan.candidate_indices
 
 
+def _partial_proxy_cost(candidate_set: dict, indices: Iterable[int]) -> float:
+    selected = sorted(set(indices))
+    selected_cost = sum(
+        float(candidate_set["candidates"][index].get("estimated_bytes", 0.0))
+        for index in selected
+    )
+    raw = _raw_by_source(candidate_set)
+    covered = _covered_sources(candidate_set, selected)
+    fallback = 0.0
+    for source_id in candidate_set.get("source_universe", []):
+        if source_id in covered:
+            continue
+        raw_index = raw.get(source_id)
+        if raw_index is not None:
+            fallback += float(candidate_set["candidates"][raw_index].get("estimated_bytes", 0.0))
+    return selected_cost + fallback
+
+
 def bounded_exhaustive_search(
     candidate_set: dict,
     *,
     max_non_raw: int = 20,
     max_results: int = 128,
 ) -> list[SearchPlan]:
-    """Enumerate non-overlapping non-raw subsets when the space is tractable."""
+    """Enumerate non-overlapping/conflict-free non-raw subsets when tractable."""
     available = _non_raw_indices(candidate_set)
     if len(available) > max_non_raw:
         return beam_search(candidate_set, beam_width=max(16, max_results), max_results=max_results)
@@ -119,7 +147,7 @@ def bounded_exhaustive_search(
         visit(position + 1, selected)
         index = available[position]
         proposal = selected + (index,)
-        if complete_with_raw(candidate_set, proposal) is not None:
+        if _partial_valid(candidate_set, proposal):
             visit(position + 1, proposal)
 
     visit(0, ())
@@ -133,7 +161,7 @@ def beam_search(
     beam_width: int = 64,
     max_results: int = 128,
 ) -> list[SearchPlan]:
-    """Keep the lowest proxy-cost valid partial exact-cover states."""
+    """Keep the lowest proxy-cost valid partial states, then exact-cover them."""
     available = _non_raw_indices(candidate_set)
     beam: list[tuple[int, ...]] = [()]
     width = max(1, beam_width)
@@ -142,14 +170,12 @@ def beam_search(
         proposals: set[tuple[int, ...]] = set(beam)
         for state in beam:
             candidate = tuple(sorted(state + (index,)))
-            if complete_with_raw(candidate_set, candidate) is not None:
+            if _partial_valid(candidate_set, candidate):
                 proposals.add(candidate)
-        scored: list[tuple[float, tuple[int, ...]]] = []
-        for state in proposals:
-            plan = complete_with_raw(candidate_set, state)
-            if plan is not None:
-                scored.append((plan.estimated_bytes, state))
-        scored.sort(key=lambda item: (item[0], item[1]))
+        scored = sorted(
+            ((_partial_proxy_cost(candidate_set, state), state) for state in proposals),
+            key=lambda item: (item[0], item[1]),
+        )
         beam = [state for _, state in scored[:width]]
 
     results: dict[tuple[int, ...], SearchPlan] = {}
@@ -184,7 +210,7 @@ def _mutate(candidate_set: dict, state: set[int], rng: random.Random) -> set[int
                 conflicts.add(index)
         result.difference_update(conflicts)
         result.add(chosen)
-    return result
+    return result if _partial_valid(candidate_set, result) else set(state)
 
 
 def simulated_annealing(
@@ -215,6 +241,9 @@ def simulated_annealing(
         proposal_state = _mutate(candidate_set, state, rng)
         proposal = complete_with_raw(candidate_set, proposal_state)
         if proposal is None:
+            # Partial state may only become final-valid after adding another
+            # candidate. Score it with the optimistic raw proxy but do not make
+            # it the final best plan yet.
             continue
 
         progress = step / max(1, steps - 1)
@@ -251,24 +280,20 @@ def genetic_search(
             if rng.random() < 0.35:
                 proposal = set(state)
                 proposal.add(index)
-                if complete_with_raw(candidate_set, proposal) is not None:
-                    state.add(index)
+                if _partial_valid(candidate_set, proposal):
+                    state = proposal
         return state
 
     population = [random_state() for _ in range(max(2, population_size))]
     best = fallback
     for _ in range(max(1, generations)):
-        scored: list[tuple[float, set[int], SearchPlan]] = []
+        scored: list[tuple[float, set[int], SearchPlan | None]] = []
         for state in population:
             plan = complete_with_raw(candidate_set, state)
-            if plan is None:
-                continue
-            scored.append((plan.estimated_bytes, state, plan))
-            if _plan_order(plan) < _plan_order(best):
+            score = plan.estimated_bytes if plan is not None else _partial_proxy_cost(candidate_set, state)
+            scored.append((score, state, plan))
+            if plan is not None and _plan_order(plan) < _plan_order(best):
                 best = plan
-        if not scored:
-            population = [random_state() for _ in range(max(2, population_size))]
-            continue
         scored.sort(key=lambda item: (item[0], tuple(sorted(item[1]))))
         elite_count = max(2, min(len(scored), max(2, population_size // 4)))
         elites = [set(item[1]) for item in scored[:elite_count]]
@@ -289,11 +314,10 @@ def genetic_search(
             for index in ordered:
                 proposal = set(repaired)
                 proposal.add(index)
-                if complete_with_raw(candidate_set, proposal) is not None:
+                if _partial_valid(candidate_set, proposal):
                     repaired = proposal
             if rng.random() < 0.35:
-                mutated = _mutate(candidate_set, repaired, rng)
-                repaired = mutated if complete_with_raw(candidate_set, mutated) is not None else set()
+                repaired = _mutate(candidate_set, repaired, rng)
             next_population.append(repaired)
         population = next_population
     return best
