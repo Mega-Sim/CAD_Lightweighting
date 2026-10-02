@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
@@ -74,12 +76,12 @@ bool quantizable_geometry_code(const std::string& type, int code) {
         return code == 10 || code == 20 || code == 30 || code == 40;
     }
     if (type == "LWPOLYLINE") {
-        // Do not quantize bulge (42) or flag-like/dimensionless fields in the first implementation.
+        // Keep bulge (42) and angular/dimensionless fields exact in the first lossy path.
         return code == 10 || code == 20 || code == 38 || code == 39
             || code == 40 || code == 41 || code == 43;
     }
     if (type == "TEXT") {
-        // Keep angle/oblique/width-factor values exact. Quantize insertion/alignment coordinates and height only.
+        // Keep angle/oblique/width-factor values exact. Quantize coordinates and text height only.
         return code == 10 || code == 20 || code == 30
             || code == 11 || code == 21 || code == 31 || code == 40;
     }
@@ -91,6 +93,22 @@ std::string format_quantized(double value) {
     std::ostringstream out;
     out << std::setprecision(17) << std::defaultfloat << value;
     return out.str();
+}
+
+void trace_materializer_issues(TraceLedger& trace,
+                               const VerificationReport& verification,
+                               const std::string& materializer_name) {
+    for (const auto& issue : verification.issues) {
+        trace.record_for_source(issue.source_id,
+                                "materializer_verification_issue",
+                                "materializer=" + materializer_name,
+                                true,
+                                issue.category,
+                                issue.severity,
+                                issue.detail,
+                                issue.metric_name,
+                                issue.metric_value);
+    }
 }
 
 void mark_failure(PlanEvaluation& evaluation,
@@ -333,7 +351,7 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
             continue;
         }
 
-        if (trace) append_verification_issues_to_trace(*trace, evaluation.verification);
+        if (trace) trace_materializer_issues(*trace, evaluation.verification, materializer.name());
         if (!evaluation.verification.pass) {
             mark_failure(evaluation, plan, "verification",
                          "geometry/semantic/interaction round trip failed");
