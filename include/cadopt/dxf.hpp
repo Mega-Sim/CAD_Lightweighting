@@ -38,7 +38,7 @@ struct DxfBlockDefinition {
 struct DxfObject {
     std::string source_id;
     std::string type;
-    std::string name;
+    std::string description;
     std::string handle;
     std::string owner_handle;
     std::vector<std::string> referenced_handles;
