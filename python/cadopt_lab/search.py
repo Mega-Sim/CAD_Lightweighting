@@ -221,39 +221,37 @@ def simulated_annealing(
     initial_temperature_fraction: float = 0.05,
     final_temperature_fraction: float = 1.0e-6,
 ) -> SearchPlan:
-    """Search estimated-byte space with a cost-scaled annealing schedule."""
+    """Search partial candidate states; only exact-cover completions may become best."""
     if initial_temperature_fraction <= 0.0 or final_temperature_fraction <= 0.0:
         raise ValueError("temperature fractions must be positive")
 
     rng = random.Random(seed)
     state: set[int] = set()
-    current = complete_with_raw(candidate_set, state)
-    if current is None:
+    fallback = complete_with_raw(candidate_set, state)
+    if fallback is None:
         raise ValueError("candidate set has no raw exact-cover fallback")
-    best = current
+    best = fallback
+    current_score = _partial_proxy_cost(candidate_set, state)
 
-    raw_scale = max(1.0, current.estimated_bytes)
+    raw_scale = max(1.0, fallback.estimated_bytes)
     start_temperature = max(1.0e-12, raw_scale * initial_temperature_fraction)
     end_temperature = max(1.0e-12, raw_scale * final_temperature_fraction)
     steps = max(1, iterations)
 
     for step in range(steps):
         proposal_state = _mutate(candidate_set, state, rng)
-        proposal = complete_with_raw(candidate_set, proposal_state)
-        if proposal is None:
-            # Partial state may only become final-valid after adding another
-            # candidate. Score it with the optimistic raw proxy but do not make
-            # it the final best plan yet.
-            continue
+        proposal_score = _partial_proxy_cost(candidate_set, proposal_state)
 
         progress = step / max(1, steps - 1)
         temperature = start_temperature * ((end_temperature / start_temperature) ** progress)
-        delta = proposal.estimated_bytes - current.estimated_bytes
+        delta = proposal_score - current_score
         if delta <= 0.0 or rng.random() < math.exp(-delta / max(temperature, 1.0e-12)):
             state = proposal_state
-            current = proposal
-        if _plan_order(current) < _plan_order(best):
-            best = current
+            current_score = proposal_score
+
+        exact = complete_with_raw(candidate_set, state)
+        if exact is not None and _plan_order(exact) < _plan_order(best):
+            best = exact
     return best
 
 
