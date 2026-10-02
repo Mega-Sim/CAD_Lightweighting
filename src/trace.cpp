@@ -86,9 +86,19 @@ bool TraceLedger::record_loss_for_source(const std::string& source_id,
                              metric_value);
 }
 
+bool TraceLedger::has_fatal_issue() const noexcept {
+    for (const auto& entity : entities_) {
+        for (const auto& step : entity.steps) {
+            if (step.severity == "fatal") return true;
+        }
+    }
+    return false;
+}
+
 std::string TraceLedger::to_json() const {
     std::ostringstream out;
-    out << "{\"entities\":[";
+    out << "{\"has_fatal_issue\":" << (has_fatal_issue() ? "true" : "false")
+        << ",\"entities\":[";
     for (std::size_t i = 0; i < entities_.size(); ++i) {
         if (i) out << ',';
         const auto& e = entities_[i];
