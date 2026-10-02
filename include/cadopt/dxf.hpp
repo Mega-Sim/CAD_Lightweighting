@@ -56,11 +56,13 @@ public:
     const std::vector<DxfEntity>& entities() const noexcept { return entities_; }
     const std::vector<DxfBlockDefinition>& blocks() const noexcept { return blocks_; }
     const std::vector<DxfObject>& objects() const noexcept { return objects_; }
+    const std::string& original_bytes() const noexcept { return original_bytes_; }
     std::vector<DxfEntity>& mutable_entities_for_test() noexcept { return entities_; }
 
     std::string semantic_fingerprint(const DxfEntity& entity) const;
 
 private:
+    std::string original_bytes_;
     std::vector<DxfRecord> records_;
     std::vector<DxfEntity> entities_;
     std::vector<DxfBlockDefinition> blocks_;
