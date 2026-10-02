@@ -35,6 +35,15 @@ public:
                 std::string detail = {},
                 std::string metric_name = {},
                 double metric_value = 0.0);
+    bool record_for_source(const std::string& source_id,
+                           std::string operation,
+                           std::string parameters,
+                           bool potentially_lossy = false,
+                           std::string loss_category = "none",
+                           std::string severity = "info",
+                           std::string detail = {},
+                           std::string metric_name = {},
+                           double metric_value = 0.0);
     bool record_loss_for_source(const std::string& source_id,
                                 std::string category,
                                 std::string severity,
