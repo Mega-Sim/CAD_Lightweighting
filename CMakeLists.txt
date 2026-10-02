@@ -78,6 +78,14 @@ if(CADOPT_BUILD_TESTS)
     CADOPT_TEST_NATIVE_BACKEND_PATH="$<TARGET_FILE:cadopt_fake_native_backend>"
   )
   add_test(NAME cadopt_native_backend_tests COMMAND cadopt_native_backend_tests)
+
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME cadopt_python_search_tests
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_search.py)
+  else()
+    message(STATUS "Python3 interpreter not found: cadopt_python_search_tests will not run")
+  endif()
 endif()
 
 if(CADOPT_BUILD_GUI)
