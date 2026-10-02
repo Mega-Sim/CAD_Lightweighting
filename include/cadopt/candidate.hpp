@@ -16,6 +16,7 @@ enum class CandidateKind {
     Symmetry,
     Grid,
     SequenceGrammar,
+    PrimitiveReductionProbe,
     TensorProbe,
     WaveletProbe,
     SpectralProbe
@@ -51,6 +52,9 @@ struct CandidateRecipe {
     std::vector<std::string> source_ids;
     std::string reference_source_id;
     std::vector<std::string> conflicts;
+    // Ordered transformation recipe. Distinct orders are represented as
+    // distinct candidates so M5 can compare order as part of the search space.
+    std::vector<std::string> transform_chain;
     std::string reconstruction_recipe;
     std::string provenance;
     double estimated_bytes{};
