@@ -216,12 +216,26 @@ static void test_recompute_winner_uses_actual_dwg_bytes_across_materializers() {
             "actual serialized DWG bytes must outrank all estimated costs");
 }
 
+static void test_native_backend_missing_library_fails_closed() {
+    bool rejected = false;
+    try {
+        cadopt::NativeLibraryDwgBackend backend(
+            fs::temp_directory_path() / "cadopt_backend_that_does_not_exist.so",
+            cadopt::DwgBackendProfile::OdaSdk);
+        (void)backend;
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    require(rejected, "missing native DWG backend library must fail closed");
+}
+
 int main() {
     try {
         test_exact_evaluator_accepts_verified_round_trip();
         test_exact_evaluator_rejects_round_trip_semantic_loss();
         test_plan_aware_quantization_passes_only_inside_geometry_tolerance();
         test_recompute_winner_uses_actual_dwg_bytes_across_materializers();
+        test_native_backend_missing_library_fails_closed();
         std::cout << "cadopt_evaluator_tests: PASS\n";
         return 0;
     } catch (const std::exception& error) {
