@@ -57,6 +57,21 @@ def candidate_set() -> dict:
     }
 
 
+def replacement_candidate_set() -> dict:
+    data = candidate_set()
+    data["candidates"].append(
+        {
+            "id": "nonraw-b",
+            "kind": "primitive_reduction_probe",
+            "source_ids": ["b"],
+            "estimated_bytes": 5.0,
+            "preserves_selection_cardinality": True,
+            "conflicts": [],
+        }
+    )
+    return data
+
+
 class SearchTests(unittest.TestCase):
     def test_complete_with_raw_rejects_declared_conflict(self) -> None:
         data = candidate_set()
@@ -68,6 +83,18 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(plans)
         self.assertEqual(plans[0].estimated_bytes, 40.0)
         self.assertEqual(plans[0].candidate_indices, (2,))
+
+    def test_partial_state_can_replace_a_conflicting_raw_fallback(self) -> None:
+        data = replacement_candidate_set()
+        plans = bounded_exhaustive_search(data, max_non_raw=8, max_results=16)
+        self.assertTrue(plans)
+        self.assertEqual(plans[0].estimated_bytes, 6.0)
+        self.assertEqual(plans[0].candidate_indices, (3, 4))
+
+        beam = beam_search(data, beam_width=16, max_results=16)
+        self.assertTrue(beam)
+        self.assertEqual(beam[0].estimated_bytes, 6.0)
+        self.assertEqual(beam[0].candidate_indices, (3, 4))
 
     def test_beam_search_keeps_valid_exact_covers(self) -> None:
         plans = beam_search(candidate_set(), beam_width=4, max_results=4)
