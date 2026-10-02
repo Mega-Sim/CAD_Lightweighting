@@ -44,19 +44,22 @@ void TraceLedger::record(std::size_t entity_index,
     entities_[entity_index].steps.push_back(std::move(step));
 }
 
-bool TraceLedger::record_loss_for_source(const std::string& source_id,
-                                         std::string category,
-                                         std::string severity,
-                                         std::string detail,
-                                         std::string metric_name,
-                                         double metric_value) {
+bool TraceLedger::record_for_source(const std::string& source_id,
+                                    std::string operation,
+                                    std::string parameters,
+                                    bool potentially_lossy,
+                                    std::string loss_category,
+                                    std::string severity,
+                                    std::string detail,
+                                    std::string metric_name,
+                                    double metric_value) {
     for (std::size_t i = 0; i < entities_.size(); ++i) {
         if (entities_[i].source_id != source_id) continue;
         record(i,
-               "verification_issue",
-               "source_correlated=true",
-               true,
-               std::move(category),
+               std::move(operation),
+               std::move(parameters),
+               potentially_lossy,
+               std::move(loss_category),
                std::move(severity),
                std::move(detail),
                std::move(metric_name),
@@ -64,6 +67,23 @@ bool TraceLedger::record_loss_for_source(const std::string& source_id,
         return true;
     }
     return false;
+}
+
+bool TraceLedger::record_loss_for_source(const std::string& source_id,
+                                         std::string category,
+                                         std::string severity,
+                                         std::string detail,
+                                         std::string metric_name,
+                                         double metric_value) {
+    return record_for_source(source_id,
+                             "verification_issue",
+                             "source_correlated=true",
+                             true,
+                             std::move(category),
+                             std::move(severity),
+                             std::move(detail),
+                             std::move(metric_name),
+                             metric_value);
 }
 
 std::string TraceLedger::to_json() const {
