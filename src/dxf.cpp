@@ -178,12 +178,14 @@ void DxfDocument::rebuild_semantic_indexes() {
                 const auto rec_value = trim(records_[j].value);
                 if (records_[j].code == 5 && object.handle.empty()) object.handle = rec_value;
                 if (records_[j].code == 330 && object.owner_handle.empty()) object.owner_handle = rec_value;
-                if (type == "GROUP" && records_[j].code == 300 && object.name.empty()) object.name = rec_value;
+                if (type == "GROUP" && records_[j].code == 300 && object.description.empty()) {
+                    object.description = rec_value;
+                }
                 if (type == "GROUP" && records_[j].code == 340) object.referenced_handles.push_back(rec_value);
                 if (records_[j].code == 1001) object.xdata_apps.push_back(rec_value);
             }
             const auto identity = !object.handle.empty() ? object.handle
-                                : (!object.name.empty() ? object.name : type + ":" + std::to_string(first));
+                                : type + ":" + std::to_string(first);
             object.source_id = "O:" + identity + ":" + std::to_string(first);
             objects_.push_back(std::move(object));
             i = last;
