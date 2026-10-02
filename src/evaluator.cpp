@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 namespace cadopt {
 namespace {
@@ -34,10 +35,12 @@ void mark_failure(PlanEvaluation& evaluation,
                   std::string stage,
                   std::string reason) {
     evaluation.valid = false;
+    evaluation.verification.pass = false;
     evaluation.failure_stage = std::move(stage);
     evaluation.failure_reason = std::move(reason);
-    set_exact_evaluation(plan, evaluation.exact_dwg_bytes.value_or(0), false,
-                         evaluation.failure_stage + ": " + evaluation.failure_reason);
+    plan.exact_valid = false;
+    if (evaluation.exact_dwg_bytes) plan.exact_dwg_bytes = evaluation.exact_dwg_bytes;
+    plan.issues.push_back(evaluation.failure_stage + ": " + evaluation.failure_reason);
 }
 
 } // namespace
@@ -136,6 +139,7 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
         failure.materializer = materializer.name();
         failure.failure_stage = "work_directory";
         failure.failure_reason = error.message();
+        failure.verification.pass = false;
         report.evaluations.push_back(std::move(failure));
         return report;
     }
@@ -147,6 +151,7 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
         failure.materializer = materializer.name();
         failure.failure_stage = "backend_capability";
         failure.failure_reason = "backend must support DWG write, DWG read, and independent round trip";
+        failure.verification.pass = false;
         report.evaluations.push_back(std::move(failure));
         return report;
     }
