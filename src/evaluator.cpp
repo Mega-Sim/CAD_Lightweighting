@@ -1,9 +1,13 @@
 #include <cadopt/evaluator.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 namespace cadopt {
@@ -30,6 +34,65 @@ std::filesystem::path effective_work_directory(const EvaluationOptions& options)
     return std::filesystem::temp_directory_path() / "cadopt_m6_eval";
 }
 
+bool plan_is_materializable(const CandidateSet& candidate_set,
+                            const CandidatePlan& plan,
+                            std::string& error) {
+    if (!plan.structurally_valid) {
+        error = "candidate plan is not a valid exact cover";
+        return false;
+    }
+    for (const auto index : plan.candidate_indices) {
+        if (index >= candidate_set.candidates.size()) {
+            error = "candidate plan contains an out-of-range candidate index";
+            return false;
+        }
+        if (!candidate_set.candidates[index].preserves_selection_cardinality) {
+            error = "candidate plan would change customer-visible selection cardinality";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parse_double(const std::string& text, double& value) {
+    char* end = nullptr;
+    value = std::strtod(text.c_str(), &end);
+    if (end == text.c_str()) return false;
+    while (end && *end != '\0') {
+        if (*end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') return false;
+        ++end;
+    }
+    return std::isfinite(value);
+}
+
+bool quantizable_geometry_code(const std::string& type, int code) {
+    if (type == "LINE") {
+        return code == 10 || code == 20 || code == 30
+            || code == 11 || code == 21 || code == 31;
+    }
+    if (type == "ARC" || type == "CIRCLE") {
+        return code == 10 || code == 20 || code == 30 || code == 40;
+    }
+    if (type == "LWPOLYLINE") {
+        // Do not quantize bulge (42) or flag-like/dimensionless fields in the first implementation.
+        return code == 10 || code == 20 || code == 38 || code == 39
+            || code == 40 || code == 41 || code == 43;
+    }
+    if (type == "TEXT") {
+        // Keep angle/oblique/width-factor values exact. Quantize insertion/alignment coordinates and height only.
+        return code == 10 || code == 20 || code == 30
+            || code == 11 || code == 21 || code == 31 || code == 40;
+    }
+    return false;
+}
+
+std::string format_quantized(double value) {
+    if (value == 0.0) value = 0.0; // canonicalize negative zero
+    std::ostringstream out;
+    out << std::setprecision(17) << std::defaultfloat << value;
+    return out.str();
+}
+
 void mark_failure(PlanEvaluation& evaluation,
                   CandidatePlan& plan,
                   std::string stage,
@@ -51,16 +114,9 @@ MaterializationResult StrictSourceMaterializer::materialize(
     const CandidatePlan& plan,
     const std::filesystem::path& output_dxf) const {
 
-    if (!plan.structurally_valid) {
-        return {false, "candidate plan is not a valid exact cover", {}};
-    }
-    for (const auto index : plan.candidate_indices) {
-        if (index >= candidate_set.candidates.size()) {
-            return {false, "candidate plan contains an out-of-range candidate index", {}};
-        }
-        if (!candidate_set.candidates[index].preserves_selection_cardinality) {
-            return {false, "candidate plan would change customer-visible selection cardinality", {}};
-        }
+    std::string validation_error;
+    if (!plan_is_materializable(candidate_set, plan, validation_error)) {
+        return {false, validation_error, {}};
     }
 
     try {
@@ -69,6 +125,65 @@ MaterializationResult StrictSourceMaterializer::materialize(
         return {false, error.what(), {}};
     }
     return {true, "strict source-equivalent reconstruction", output_dxf};
+}
+
+NumericQuantizationMaterializer::NumericQuantizationMaterializer(double step)
+    : step_(step) {
+    if (!std::isfinite(step_) || step_ <= 0.0) {
+        throw std::invalid_argument("numeric quantization step must be finite and positive");
+    }
+}
+
+std::string NumericQuantizationMaterializer::name() const {
+    std::ostringstream out;
+    out << "numeric-quantization(step=" << std::setprecision(17) << step_ << ')';
+    return out.str();
+}
+
+MaterializationResult NumericQuantizationMaterializer::materialize(
+    const DxfDocument& source,
+    const CandidateSet& candidate_set,
+    const CandidatePlan& plan,
+    const std::filesystem::path& output_dxf) const {
+
+    std::string validation_error;
+    if (!plan_is_materializable(candidate_set, plan, validation_error)) {
+        return {false, validation_error, {}};
+    }
+
+    std::unordered_set<std::size_t> quantizable_records;
+    for (const auto& entity : source.entities()) {
+        for (std::size_t index = entity.first_record;
+             index < entity.last_record_exclusive && index < source.records().size(); ++index) {
+            if (quantizable_geometry_code(entity.type, source.records()[index].code)) {
+                quantizable_records.insert(index);
+            }
+        }
+    }
+
+    std::ofstream out(output_dxf, std::ios::binary | std::ios::trunc);
+    if (!out) return {false, "unable to create quantized DXF: " + output_dxf.string(), {}};
+
+    const auto& records = source.records();
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        const auto& record = records[index];
+        out << record.raw_code_line << '\n';
+        if (!quantizable_records.contains(index)) {
+            out << record.raw_value_line << '\n';
+            continue;
+        }
+
+        double value = 0.0;
+        if (!parse_double(record.value, value)) {
+            out << record.raw_value_line << '\n';
+            continue;
+        }
+        const double quantized = std::round(value / step_) * step_;
+        out << format_quantized(quantized) << '\n';
+    }
+    out.flush();
+    if (!out) return {false, "failed while writing quantized DXF", {}};
+    return {true, name(), output_dxf};
 }
 
 const PlanEvaluation* EvaluationReport::winner() const {
@@ -231,15 +346,7 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
         report.evaluations.push_back(std::move(evaluation));
     }
 
-    const auto* best_plan = choose_best_exact_plan(plans);
-    if (best_plan) {
-        for (std::size_t i = 0; i < report.evaluations.size(); ++i) {
-            if (report.evaluations[i].plan_id == best_plan->id && report.evaluations[i].valid) {
-                report.winner_index = i;
-                break;
-            }
-        }
-    }
+    recompute_winner(report);
 
     if (!options.keep_artifacts && report.winner_index) {
         for (std::size_t i = 0; i < report.evaluations.size(); ++i) {
@@ -252,6 +359,51 @@ EvaluationReport evaluate_candidate_plans(const DxfDocument& source,
     }
 
     return report;
+}
+
+void recompute_winner(EvaluationReport& report) {
+    report.winner_index.reset();
+    for (std::size_t i = 0; i < report.evaluations.size(); ++i) {
+        const auto& evaluation = report.evaluations[i];
+        if (!evaluation.valid || !evaluation.exact_dwg_bytes) continue;
+        if (!report.winner_index) {
+            report.winner_index = i;
+            continue;
+        }
+        const auto& best = report.evaluations[*report.winner_index];
+        if (*evaluation.exact_dwg_bytes < *best.exact_dwg_bytes
+            || (*evaluation.exact_dwg_bytes == *best.exact_dwg_bytes
+                && (evaluation.estimated_bytes < best.estimated_bytes
+                    || (evaluation.estimated_bytes == best.estimated_bytes
+                        && evaluation.materializer < best.materializer)))) {
+            report.winner_index = i;
+        }
+    }
+}
+
+bool append_evaluation_report(EvaluationReport& destination,
+                              EvaluationReport source,
+                              std::string* error_message) {
+    if (!destination.evaluations.empty()) {
+        if (destination.backend.profile != source.backend.profile
+            || destination.backend.name != source.backend.name) {
+            if (error_message) *error_message = "cannot merge evaluation reports from different backends";
+            return false;
+        }
+        if (destination.source_dxf_bytes != source.source_dxf_bytes) {
+            if (error_message) *error_message = "cannot merge evaluation reports from different source sizes";
+            return false;
+        }
+    } else {
+        destination.source_dxf_bytes = source.source_dxf_bytes;
+        destination.backend = source.backend;
+    }
+
+    destination.evaluations.insert(destination.evaluations.end(),
+                                   std::make_move_iterator(source.evaluations.begin()),
+                                   std::make_move_iterator(source.evaluations.end()));
+    recompute_winner(destination);
+    return true;
 }
 
 bool copy_winner_dwg(const EvaluationReport& report,
