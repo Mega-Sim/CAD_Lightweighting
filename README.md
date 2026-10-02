@@ -7,10 +7,10 @@ Research-first **DXF → DWG lightweighting engine**. The product objective is i
 - Input: **DXF**.
 - Output: **DWG**.
 - Core languages: **C++20 + Python 3**.
-- Intermediate representation is unrestricted: coordinate translation, XYZ rotation, axis changes, uniform normalization, temporary grouping, reference/residual representations, grammar/grid forms, tensor/wavelet/spectral probes, compression, and future lossy candidates are allowed internally.
+- Intermediate representation is unrestricted: coordinate translation, XYZ rotation, axis changes, uniform normalization, temporary grouping, reference/residual representations, grammar/grid forms, tensor/wavelet/spectral probes, compression, and lossy candidates are allowed internally.
 - Final output must preserve more than appearance. Geometry, CAD semantics, selection units, block/group/reference relationships, and practical edit behavior are verification constraints.
 - Temporary merging/blocking is allowed only inside the optimizer; if source lines were individually selectable, the final output must restore equivalent individual selection/edit units.
-- Absolute coordinates are low-priority inside the optimizer; physical shape/relative relationships and exact reconstruction are authoritative.
+- Absolute coordinates are low-priority inside the optimizer; physical shape/relative relationships and correct final reconstruction are authoritative.
 - Research runtime is secondary to finding the smallest valid result.
 - **Final objective = actual serialized DWG filesystem bytes.** Intermediate compression/description-length estimates are search hints only.
 - Loss/difference traceability is a first-class requirement.
@@ -74,6 +74,7 @@ Source implementation:
 
 - global/structural/local scopes are all allowed; no single scope is privileged
 - raw source fallback
+- bounded whole-drawing numeric quantization probes
 - transform-invariant exact-repeat signatures
 - reference + transform candidates
 - near-repeat reference + residual candidates
@@ -81,6 +82,8 @@ Source implementation:
 - whole-drawing structural estimate
 - dependency-free Python tensor/wavelet/spectral suitability probes
 - candidate provenance, exact source coverage, reconstruction recipe, estimated bytes, residual estimate, and loss risk
+
+`NumericQuantization` is the first candidate family that can alter serialized numeric values while preserving entity count/type/layer/block/group structure. Angle/bulge/dimensionless fields remain exact in the first lossy path so different error units are not mixed.
 
 See `docs/MILESTONE_4.md`.
 
@@ -108,24 +111,32 @@ Source implementation:
 
 - backend capability/profile model: external command / ODA File Converter / ODA SDK host / RealDWG host
 - proprietary backend binaries are **not** bundled
-- converter templates must contain both `{input}` and `{output}` and fail closed on missing/stale/empty output
-- candidate materializer boundary
+- external command adapter with strict `{input}` / `{output}` validation
+- runtime native DLL/SO adapter for separately licensed ODA/RealDWG hosts
+- stable C ABI in `include/cadopt/native_backend_api.h`
+- fail-closed ABI version/symbol/output validation
+- `StrictSourceMaterializer`, `NumericQuantizationMaterializer`, and `PlanAwareMaterializer`
 - real DWG filesystem byte measurement
 - independent DWG → DXF reverse conversion
 - independent geometry + semantic + interaction verification
 - smallest verified DWG winner selection
-- `--research` CLI path: canonical probe → candidate discovery → search → exact DWG evaluation → reverse verification → winner copy
+- `--research` CLI path: canonical probe → candidate discovery → search → materialization → exact DWG evaluation → reverse verification → winner copy
 - machine-readable candidate/search/evaluation/trace report
+- fake native DLL/SO test backend using the same ABI for PR-time loader verification
 
-See `docs/MILESTONE_6.md`.
+See `docs/MILESTONE_6.md` and `docs/NATIVE_DWG_BACKEND.md`.
 
-## Important current limitation
+## Important verification boundary
 
-M3-M6 are currently **source implementations, not yet PR-time build/regression verified**. Per project workflow, build/test execution is deferred until a PR is requested. The test source and verification checklist are already included.
+M2-M6 are currently **source implementations, not yet PR-time build/regression verified**. Per project workflow, build/test execution is deferred until a PR is requested. Test sources and the verification checklist are included now.
 
-The first M6 materializer is intentionally `StrictSourceMaterializer`: it reconstructs the original source entity units exactly before serialization. This proves the full safety and black-box evaluation loop, but it also means **the M4/M5 structural compression estimates are not yet a claim of measured DWG reduction**. A later source-equivalent optimized materializer must actually alter native CAD serialization, pass the same interaction/semantic gate, and then prove a smaller DWG byte count.
+M6 does have an actual materializable lightweighting path: `PlanAwareMaterializer` can apply bounded numeric quantization to supported coordinate/distance fields, serialize the candidate through a real DWG backend, reverse-convert it, and reject it when geometry/semantic/interaction verification fails.
 
-Also, this repository does not ship Autodesk RealDWG or ODA SDK/converter binaries. Real DWG evaluation requires a separately installed/licensed backend supplied through explicit command templates.
+Structural reference/grid/grammar/tensor/wavelet/spectral candidates are still **analysis/search representations** in the generic DXF materializer. They are deliberately rejected instead of being serialized in a way that could alter customer-visible selection/edit behavior. A licensed backend-specific materializer may implement those recipes later under the same independent verifier.
+
+Therefore **no compression percentage is claimed from source code alone**. A reduction is valid only after a real DXF input is serialized to DWG, actual output bytes are measured, the DWG is independently read back, and all hard equivalence checks pass.
+
+This repository also does not ship Autodesk RealDWG or ODA SDK/converter binaries. A production backend must be installed/licensed separately and connected either through explicit command templates or the native plugin ABI.
 
 ## Build
 
@@ -178,6 +189,9 @@ Backend command syntax depends on the separately installed backend; do not subst
   --backend-profile external \
   --dxf-to-dwg 'INSTALLED_ENCODER_COMMAND {input} {output}' \
   --dwg-to-dxf 'INSTALLED_DECODER_COMMAND {input} {output}' \
+  --quantize-steps 1e-10,5e-10,1e-9 \
+  --geometry-abs-tol 1e-9 \
+  --geometry-rel-tol 1e-9 \
   --max-plans 16 \
   --beam-width 64 \
   --work-dir build/research \
@@ -186,20 +200,30 @@ Backend command syntax depends on the separately installed backend; do not subst
 
 No winner is accepted if backend conversion fails, reverse conversion fails, or geometry/semantic/interaction verification fails.
 
+## Native backend integration
+
+Production ODA/RealDWG hosts implement the ABI in:
+
+```text
+include/cadopt/native_backend_api.h
+```
+
+The optimizer's `NativeLibraryDwgBackend` loads the host DLL/SO at runtime. Proprietary headers/libraries remain outside this repository. See `docs/NATIVE_DWG_BACKEND.md`.
+
 ## Repository layout
 
 ```text
-include/cadopt/       C++ public interfaces
+include/cadopt/       C++ public interfaces and native backend ABI
 src/                  Source Truth, geometry, candidate/search/evaluator, verifier, trace, DWG backend, CLI
 python/cadopt_lab/    experimental probes/search/QUBO/experiment records
 app/minimal_qt/       optional file-picker-only shell
-tests/                regression test sources and fixtures
-docs/                 decisions, milestone notes, architecture/implementation plan, PR verification checklist
+tests/                regression test sources, fake native backend, and fixtures
+docs/                 decisions, milestone notes, architecture/implementation plan, backend contract, PR verification checklist
 ```
 
 ## Verification checklist
 
-See `docs/M3_M6_VERIFICATION.md` for the PR-time Linux build/test/dry-run/fail-closed/real-backend verification sequence.
+See `docs/M3_M6_VERIFICATION.md` for the PR-time Linux build/test/dry-run/fail-closed/native-loader/real-backend verification sequence.
 
 ## Reference drawing
 
