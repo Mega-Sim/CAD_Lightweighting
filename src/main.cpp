@@ -13,12 +13,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -34,11 +36,27 @@ struct Options {
     bool dry_run{};
     bool research{};
     bool keep_artifacts{true};
-    std::size_t max_plans{16};
+    std::size_t max_plans{4};
+    std::size_t max_search_plans{128};
     std::size_t beam_width{64};
     double geometry_absolute_tolerance{1.0e-9};
     double geometry_relative_tolerance{1.0e-9};
     std::vector<double> quantization_steps{1.0e-10, 5.0e-10, 1.0e-9};
+};
+
+struct ExactQueueDecision {
+    std::string plan_id;
+    std::string status;
+    std::string materialization_key;
+    std::string reason;
+    double estimated_bytes{};
+};
+
+struct ExactEvaluationQueue {
+    std::size_t exact_budget{};
+    std::size_t supported_unique{};
+    std::vector<std::size_t> selected_plan_indices;
+    std::vector<ExactQueueDecision> decisions;
 };
 
 static std::string escape_json(const std::string& s) {
@@ -164,6 +182,9 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--dwg-to-dxf") o.dwg_to_dxf = value(a.c_str());
         else if (a == "--backend-profile") o.backend_profile = value(a.c_str());
         else if (a == "--max-plans") o.max_plans = parse_size(value(a.c_str()), "--max-plans");
+        else if (a == "--max-search-plans") {
+            o.max_search_plans = parse_size(value(a.c_str()), "--max-search-plans");
+        }
         else if (a == "--beam-width") o.beam_width = parse_size(value(a.c_str()), "--beam-width");
         else if (a == "--geometry-abs-tol") {
             o.geometry_absolute_tolerance = parse_nonnegative_double(value(a.c_str()), "--geometry-abs-tol");
@@ -185,7 +206,8 @@ static Options parse_args(int argc, char** argv) {
                 << "  --backend-profile NAME    external|oda-file-converter|oda-sdk|realdwg-host\n"
                 << "  --dxf-to-dwg CMD          Converter command template with {input} and {output}\n"
                 << "  --dwg-to-dxf CMD          DWG input/reverse command with {input} and {output}\n"
-                << "  --max-plans N             Maximum exact DWG candidate evaluations (default 16; 0=all)\n"
+                << "  --max-plans N             Expensive exact DWG evaluations after preflight (default 4; 0=all)\n"
+                << "  --max-search-plans N      Cheap M5 plan pool retained before exact preflight (default 128)\n"
                 << "  --beam-width N            Beam width for broad candidate search (default 64)\n"
                 << "  --geometry-abs-tol V      Absolute geometry verification tolerance (default 1e-9)\n"
                 << "  --geometry-rel-tol V      Relative geometry verification tolerance (default 1e-9)\n"
@@ -225,6 +247,7 @@ static void write_research_report(const fs::path& path,
                                   const Options& options,
                                   const cadopt::CandidateSet& candidates,
                                   const std::vector<cadopt::CandidatePlan>& plans,
+                                  const ExactEvaluationQueue& queue,
                                   const cadopt::EvaluationReport& evaluation,
                                   const cadopt::TraceLedger& trace) {
     std::ofstream out(path, std::ios::trunc);
@@ -240,7 +263,22 @@ static void write_research_report(const fs::path& path,
         out << "\n    " << cadopt::candidate_plan_to_json(plans[i], candidates);
     }
     if (!plans.empty()) out << '\n';
-    out << "  ],\n  \"evaluation\": " << evaluation.to_json() << ",\n"
+    out << "  ],\n  \"evaluation_queue\": {\"exact_budget\": " << queue.exact_budget
+        << ", \"supported_unique\": " << queue.supported_unique
+        << ", \"selected_count\": " << queue.selected_plan_indices.size()
+        << ", \"decisions\": [";
+    for (std::size_t i = 0; i < queue.decisions.size(); ++i) {
+        if (i) out << ',';
+        const auto& decision = queue.decisions[i];
+        out << "\n    {\"plan_id\": \"" << escape_json(decision.plan_id)
+            << "\", \"estimated_bytes\": " << decision.estimated_bytes
+            << ", \"status\": \"" << escape_json(decision.status)
+            << "\", \"materialization_key\": \""
+            << escape_json(decision.materialization_key)
+            << "\", \"reason\": \"" << escape_json(decision.reason) << "\"}";
+    }
+    if (!queue.decisions.empty()) out << '\n';
+    out << "  ]},\n  \"evaluation\": " << evaluation.to_json() << ",\n"
         << "  \"trace\": " << trace.to_json() << "\n}\n";
 }
 
@@ -329,11 +367,11 @@ static std::vector<std::size_t> raw_candidate_indices(const cadopt::CandidateSet
 static std::vector<cadopt::CandidatePlan> build_research_plans(
     const cadopt::CandidateSet& candidates,
     std::size_t beam_width,
-    std::size_t max_plans) {
+    std::size_t max_search_plans) {
 
     cadopt::SearchOptions options;
     options.beam_width = std::max<std::size_t>(1, beam_width);
-    options.max_results = std::max<std::size_t>(max_plans, 16);
+    options.max_results = std::max<std::size_t>(max_search_plans, 16);
 
     std::vector<cadopt::CandidatePlan> mandatory;
     std::vector<cadopt::CandidatePlan> optional;
@@ -377,8 +415,178 @@ static std::vector<cadopt::CandidatePlan> build_research_plans(
     for (auto& plan : mandatory) plans.push_back(std::move(plan));
     for (auto& plan : optional) plans.push_back(std::move(plan));
 
-    if (max_plans != 0 && plans.size() > max_plans) plans.resize(max_plans);
+    if (max_search_plans != 0 && plans.size() > max_search_plans) plans.resize(max_search_plans);
     return plans;
+}
+
+static bool plan_aware_preflight(const cadopt::CandidateSet& candidates,
+                                 const cadopt::CandidatePlan& plan,
+                                 std::string& materialization_key,
+                                 std::string& reason) {
+    if (!plan.structurally_valid) {
+        reason = "candidate plan is not a valid exact cover";
+        return false;
+    }
+
+    bool has_quantization = false;
+    double quantization_step = 0.0;
+    std::vector<std::string> quantization_candidate_ids;
+
+    for (const auto index : plan.candidate_indices) {
+        if (index >= candidates.candidates.size()) {
+            reason = "candidate plan contains an out-of-range candidate index";
+            return false;
+        }
+        const auto& candidate = candidates.candidates[index];
+        if (!candidate.preserves_selection_cardinality) {
+            reason = "candidate plan would change customer-visible selection cardinality";
+            return false;
+        }
+        switch (candidate.kind) {
+        case cadopt::CandidateKind::Raw:
+            break;
+        case cadopt::CandidateKind::NumericQuantization:
+            if (!std::isfinite(candidate.numeric_parameter) || candidate.numeric_parameter <= 0.0) {
+                reason = candidate.id + " has an invalid numeric quantization step";
+                return false;
+            }
+            if (has_quantization
+                && std::abs(candidate.numeric_parameter - quantization_step)
+                    > std::max(1.0e-18, std::abs(quantization_step) * 1.0e-12)) {
+                reason = "one generic DXF materialization cannot mix different whole-drawing quantization steps";
+                return false;
+            }
+            has_quantization = true;
+            quantization_step = candidate.numeric_parameter;
+            quantization_candidate_ids.push_back(candidate.id);
+            break;
+        case cadopt::CandidateKind::ReferenceTransform:
+        case cadopt::CandidateKind::ReferenceResidual:
+        case cadopt::CandidateKind::Symmetry:
+        case cadopt::CandidateKind::Grid:
+        case cadopt::CandidateKind::SequenceGrammar:
+        case cadopt::CandidateKind::PrimitiveReductionProbe:
+        case cadopt::CandidateKind::TensorProbe:
+        case cadopt::CandidateKind::WaveletProbe:
+        case cadopt::CandidateKind::SpectralProbe:
+            reason = "candidate kind " + cadopt::candidate_kind_name(candidate.kind)
+                + " is analysis-only for the generic DXF materializer; native backend reconstruction is required";
+            return false;
+        }
+    }
+
+    if (!has_quantization) {
+        materialization_key = "plan-aware:raw";
+        reason = "generic DXF materializer can reproduce this plan exactly";
+        return true;
+    }
+
+    std::sort(quantization_candidate_ids.begin(), quantization_candidate_ids.end());
+    std::ostringstream key;
+    key << "plan-aware:quant:" << std::setprecision(17) << quantization_step;
+    for (const auto& id : quantization_candidate_ids) key << ':' << id;
+    materialization_key = key.str();
+    reason = "generic DXF materializer can emit numeric quantization plan";
+    return true;
+}
+
+static ExactEvaluationQueue build_exact_evaluation_queue(
+    const cadopt::CandidateSet& candidates,
+    const std::vector<cadopt::CandidatePlan>& plans,
+    std::size_t exact_budget) {
+
+    ExactEvaluationQueue queue;
+    queue.exact_budget = exact_budget;
+    queue.decisions.resize(plans.size());
+
+    std::unordered_map<std::string, std::size_t> representative_by_key;
+
+    auto better_representative = [&](std::size_t candidate_index, std::size_t current_index) {
+        const auto& candidate = plans[candidate_index];
+        const auto& current = plans[current_index];
+        const bool candidate_baseline = candidate.id == "m6:raw-baseline";
+        const bool current_baseline = current.id == "m6:raw-baseline";
+        if (candidate_baseline != current_baseline) return candidate_baseline;
+        if (candidate.estimated_bytes != current.estimated_bytes) {
+            return candidate.estimated_bytes < current.estimated_bytes;
+        }
+        return candidate.id < current.id;
+    };
+
+    for (std::size_t i = 0; i < plans.size(); ++i) {
+        auto& decision = queue.decisions[i];
+        decision.plan_id = plans[i].id;
+        decision.estimated_bytes = plans[i].estimated_bytes;
+
+        std::string key;
+        std::string reason;
+        if (!plan_aware_preflight(candidates, plans[i], key, reason)) {
+            decision.status = "unsupported";
+            decision.reason = std::move(reason);
+            continue;
+        }
+
+        decision.materialization_key = key;
+        decision.status = "materializable";
+        decision.reason = std::move(reason);
+
+        const auto found = representative_by_key.find(key);
+        if (found == representative_by_key.end()) {
+            representative_by_key.emplace(std::move(key), i);
+            continue;
+        }
+
+        const auto previous = found->second;
+        if (better_representative(i, previous)) {
+            auto& old_decision = queue.decisions[previous];
+            old_decision.status = "duplicate_materialization";
+            old_decision.reason = "same materialization output as representative plan " + plans[i].id;
+            found->second = i;
+        } else {
+            decision.status = "duplicate_materialization";
+            decision.reason = "same materialization output as representative plan " + plans[previous].id;
+        }
+    }
+
+    std::vector<std::size_t> representatives;
+    representatives.reserve(representative_by_key.size());
+    for (const auto& [key, index] : representative_by_key) {
+        (void)key;
+        representatives.push_back(index);
+    }
+    queue.supported_unique = representatives.size();
+
+    std::sort(representatives.begin(), representatives.end(), [&](std::size_t a, std::size_t b) {
+        const bool a_baseline = plans[a].id == "m6:raw-baseline";
+        const bool b_baseline = plans[b].id == "m6:raw-baseline";
+        if (a_baseline != b_baseline) return a_baseline;
+        if (plans[a].estimated_bytes != plans[b].estimated_bytes) {
+            return plans[a].estimated_bytes < plans[b].estimated_bytes;
+        }
+        return plans[a].id < plans[b].id;
+    });
+
+    const std::size_t selected_count = exact_budget == 0
+        ? representatives.size()
+        : std::min(exact_budget, representatives.size());
+    queue.selected_plan_indices.reserve(selected_count);
+
+    for (std::size_t position = 0; position < representatives.size(); ++position) {
+        const auto index = representatives[position];
+        auto& decision = queue.decisions[index];
+        if (position < selected_count) {
+            decision.status = "selected";
+            decision.reason = plans[index].id == "m6:raw-baseline"
+                ? "raw baseline retained before expensive exact DWG evaluation"
+                : "selected by estimated byte ranking within exact DWG budget";
+            queue.selected_plan_indices.push_back(index);
+        } else {
+            decision.status = "budget_skipped";
+            decision.reason = "materializable but outside expensive exact DWG evaluation budget";
+        }
+    }
+
+    return queue;
 }
 
 static void trace_winner(const cadopt::EvaluationReport& evaluation,
@@ -433,23 +641,44 @@ static int run_research(const Options& opt,
         return 8;
     }
 
-    auto plans = build_research_plans(candidates, opt.beam_width, opt.max_plans);
+    auto plans = build_research_plans(candidates, opt.beam_width, opt.max_search_plans);
+    const auto queue = build_exact_evaluation_queue(candidates, plans, opt.max_plans);
     std::cout << "[CADOPT][M4] source_entities=" << candidates.source_universe.size()
               << " candidates=" << candidates.candidates.size() << '\n';
-    std::cout << "[CADOPT][M5] search/evaluation plans=" << plans.size() << '\n';
+    std::cout << "[CADOPT][M5] search_plans=" << plans.size()
+              << " max_search_plans=" << opt.max_search_plans << '\n';
+    std::cout << "[CADOPT][M6][PREFLIGHT] supported_unique=" << queue.supported_unique
+              << " exact_budget=" << opt.max_plans
+              << " selected=" << queue.selected_plan_indices.size() << '\n';
+    for (const auto& decision : queue.decisions) {
+        std::cout << "[CADOPT][M6][QUEUE] plan=" << decision.plan_id
+                  << " status=" << decision.status
+                  << " estimated_bytes=" << decision.estimated_bytes;
+        if (!decision.materialization_key.empty()) {
+            std::cout << " key=" << decision.materialization_key;
+        }
+        if (!decision.reason.empty()) std::cout << " reason=" << decision.reason;
+        std::cout << '\n';
+    }
+
+    std::vector<cadopt::CandidatePlan> exact_plans;
+    exact_plans.reserve(queue.selected_plan_indices.size());
+    for (const auto index : queue.selected_plan_indices) exact_plans.push_back(plans[index]);
 
     cadopt::PlanAwareMaterializer materializer;
     cadopt::EvaluationOptions evaluation_options;
     evaluation_options.work_directory = effective_work_directory(opt) / "research";
-    evaluation_options.max_plans = opt.max_plans;
+    evaluation_options.max_plans = 0;
     evaluation_options.keep_artifacts = opt.keep_artifacts;
     evaluation_options.verification = verification_options(opt);
 
-    auto evaluation = cadopt::evaluate_candidate_plans(source, source_dxf_path, candidates, plans,
+    std::cout << "[CADOPT][M6] exact backend round-trips start count=" << exact_plans.size()
+              << " source_dxf_bytes=" << fs::file_size(source_dxf_path) << '\n';
+    auto evaluation = cadopt::evaluate_candidate_plans(source, source_dxf_path, candidates, exact_plans,
                                                         backend, materializer,
                                                         evaluation_options, &trace);
     trace_winner(evaluation, plans, candidates, trace);
-    write_research_report(opt.report, opt, candidates, plans, evaluation, trace);
+    write_research_report(opt.report, opt, candidates, plans, queue, evaluation, trace);
 
     std::string copy_error;
     if (!cadopt::copy_winner_dwg(evaluation, opt.output, &copy_error)) {
