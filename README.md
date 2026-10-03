@@ -29,6 +29,7 @@ Tracked issues:
 - #4 — M5 multi-method search and black-box size optimization
 - #5 — M6 production DWG backend, exact byte objective, and end-to-end validation
 - #6 — direct DWG input normalization through the configured backend
+- #7 — M6 large-input exact DWG evaluation funnel and backend conversion budget
 
 The branch was created from the then-current `main`. Development is based on the current repository code, not historical UI/code snapshots.
 
@@ -120,13 +121,21 @@ Implemented:
 - DWG input normalization to `<work-dir>/input/normalized_source.dxf`
 - source DWG overwrite protection
 - `StrictSourceMaterializer`, `NumericQuantizationMaterializer`, and `PlanAwareMaterializer`
+- two-stage evaluation funnel: broad cheap M5 search pool → plan-aware in-memory preflight/deduplication → bounded exact DWG queue
+- generic-DXF-unsupported structural plans rejected before invoking the external DWG converter
+- duplicate materializations collapsed by deterministic materialization key
+- raw baseline retained, then unique supported plans ranked by estimated bytes for exact-evaluation scheduling
+- `--max-search-plans` and `--max-plans` separated so search diversity does not force expensive backend round trips
 - real DWG filesystem byte measurement
 - independent DWG → DXF reverse conversion
 - independent geometry + semantic + interaction verification
 - smallest verified DWG winner selection
-- `--research` CLI path: input normalization → canonical probe → candidate discovery → search → materialization → exact DWG evaluation → reverse verification → winner copy
-- machine-readable candidate/search/evaluation/trace report
+- `--research` CLI path: input normalization → canonical probe → candidate discovery → broad search → cheap preflight/deduplication → bounded exact DWG evaluation → reverse verification → winner copy
+- machine-readable candidate/search/evaluation-queue/evaluation/trace report
+- detailed `[CADOPT][M6][PREFLIGHT]` / `[CADOPT][M6][QUEUE]` diagnostics for selected, unsupported, duplicate, and budget-skipped plans
 - fake native DLL/SO test backend using the same ABI for loader verification
+
+The queue ranking only decides **which plans are expensive enough to serialize**. It does not change the final objective: among exact-evaluated valid candidates, actual serialized DWG bytes always decide the winner.
 
 See `docs/MILESTONE_6.md` and `docs/NATIVE_DWG_BACKEND.md`.
 
@@ -139,7 +148,7 @@ Windows MinGW 13.1 verification before the direct-DWG-input follow-up:
 - CLI `minimal.dxf` dry run PASS
 - selection units preserved
 
-Issue #6 adds an eighth regression target, `cadopt_input_tests`, covering direct DWG input normalization. Per project workflow, the new change is source-complete but its new build/CTest execution is deferred until a PR is requested.
+Issue #6 adds an eighth regression target, `cadopt_input_tests`, covering direct DWG input normalization. Issue #7 adds the large-input M6 evaluation funnel. Per project workflow, these source changes are not claimed as newly build/CTest-verified until PR-time verification is requested.
 
 Structural reference/grid/grammar/tensor/wavelet/spectral candidates are still **analysis/search representations** in the generic DXF materializer. They are deliberately rejected instead of being serialized in a way that could alter customer-visible selection/edit behavior. A licensed backend-specific materializer may implement those recipes later under the same independent verifier.
 
@@ -216,7 +225,7 @@ Direct DWG input:
   --dxf-to-dwg 'INSTALLED_ENCODER_COMMAND {input} {output}' \
   --dwg-to-dxf 'INSTALLED_DECODER_COMMAND {input} {output}' \
   --work-dir build/dwg_roundtrip \
-  --report build/roundtrip_report.json
+  --report build/dwg_roundtrip_report.json
 ```
 
 The output path must not be the same as the source drawing.
@@ -234,11 +243,14 @@ The output path must not be the same as the source drawing.
   --quantize-steps 1e-10,5e-10,1e-9 \
   --geometry-abs-tol 1e-9 \
   --geometry-rel-tol 1e-9 \
-  --max-plans 16 \
+  --max-search-plans 128 \
+  --max-plans 4 \
   --beam-width 64 \
   --work-dir build/research \
   --report build/research_report.json
 ```
+
+`--max-search-plans` controls the cheap search-plan pool retained for M6 preflight. `--max-plans` is the expensive exact DWG conversion budget **after** unsupported plans and duplicate materializations have been removed. `--max-plans 0` evaluates every unique materializable plan. For very large normalized DXF files, a smaller exact budget can be used without shrinking the broad M5 search pool.
 
 The same research command also accepts a `.dxf` input. No winner is accepted if input normalization fails, backend conversion fails, reverse conversion fails, geometry/semantic/interaction verification fails, or trace contains an unresolved fatal issue.
 
